@@ -1,0 +1,89 @@
+{
+  "model": "/home/ziheng/sparmoe/models/Qwen1.5-MoE-A2.7B-Chat",
+  "rows": [
+    {
+      "policy": "gate",
+      "knob": 0.0,
+      "drop_rate": 0.0,
+      "ppl": 13.65800948879363
+    },
+    {
+      "policy": "gate",
+      "knob": 0.02,
+      "drop_rate": 0.0044457056375331065,
+      "ppl": 13.686038328757123
+    },
+    {
+      "policy": "gate",
+      "knob": 0.05,
+      "drop_rate": 0.3049151059402194,
+      "ppl": 13.87716250639076
+    },
+    {
+      "policy": "gate",
+      "knob": 0.08,
+      "drop_rate": 0.5702652052591752,
+      "ppl": 14.42985903524736
+    },
+    {
+      "policy": "gate",
+      "knob": 0.12,
+      "drop_rate": 0.7602600028376845,
+      "ppl": 18.583855190647476
+    },
+    {
+      "policy": "rank",
+      "knob": 0,
+      "drop_rate": 0.0,
+      "ppl": 13.65800948879363
+    },
+    {
+      "policy": "rank",
+      "knob": 1,
+      "drop_rate": 0.25,
+      "ppl": 13.808081365022872
+    },
+    {
+      "policy": "rank",
+      "knob": 2,
+      "drop_rate": 0.5,
+      "ppl": 14.532571918799384
+    },
+    {
+      "policy": "rank",
+      "knob": 3,
+      "drop_rate": 0.75,
+      "ppl": 19.213631378892718
+    },
+    {
+      "policy": "mass",
+      "knob": 1.0,
+      "drop_rate": 0.0,
+      "ppl": 13.65800948879363
+    },
+    {
+      "policy": "mass",
+      "knob": 0.95,
+      "drop_rate": 0.008521921112372304,
+      "ppl": 13.718858800757737
+    },
+    {
+      "policy": "mass",
+      "knob": 0.9,
+      "drop_rate": 0.059286913545213774,
+      "ppl": 13.70911839401524
+    },
+    {
+      "policy": "mass",
+      "knob": 0.8,
+      "drop_rate": 0.25447230892924705,
+      "ppl": 13.878101728715166
+    },
+    {
+      "policy": "mass",
+      "knob": 0.7,
+      "drop_rate": 0.35797389330306467,
+      "ppl": 14.476907640416192
+    }
+  ]
+}
