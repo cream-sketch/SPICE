@@ -25,3 +25,5 @@ env/
 # papers and codex run logs (local only)
 *.pdf
 notes/codex_run_*.log
+
+notes/codex_review_*.log
