@@ -69,4 +69,29 @@ Key metrics from `anchored_eval_20260602_fix.json`:
 The four-GPU multiseed run in `multiseed_2000/` validates reproducibility across
 seeds 7, 13, 23, and 31 at 2000 draft-training steps.
 
+## Qwen1.5-MoE-A2.7B Trace Path
+
+Result files:
+
+- `qwen_moe_trace/`
+
+This run validates the real-checkpoint trace path on Qwen1.5-MoE-A2.7B:
+
+- Downloaded the model to `/home/ial-lvyx/workspace/models/Qwen1.5-MoE-A2.7B`
+  through the HuggingFace mirror endpoint.
+- Loaded Qwen with `bfloat16` and `device_map=auto`.
+- Captured all 24 `mlp.gate` router tensors.
+- Confirmed Qwen config: 60 routed experts and top-4 experts per token.
+- Evaluated verified prefetching on 256 real routed tokens.
+
+Key trace-prefetch metrics:
+
+- Oracle upper bound: hit `1.000000`, fallback `0.000000`
+- Last-observed-layer repeat: hit `0.342122`, fallback `0.657878`
+- Layer-prior predictor: hit `0.385824`, fallback `0.614176`
+
+The simple non-draft predictors leave high fallback rates on real Qwen routing
+traces, which motivates the model-specific SPICE draft predictor wrapper as the
+next experiment.
+
 Checkpoints and logs are intentionally not committed.

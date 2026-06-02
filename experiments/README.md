@@ -21,6 +21,10 @@ generate synthetic routing traces.
   self-correction.
 - `collect_hf_moe_traces.py`: captures hidden states and router logits/probs
   from a local HuggingFace MoE checkpoint for model-specific draft wrappers.
+- `eval_hf_trace_prefetch.py`: evaluates verified prefetch hit/fallback rates
+  directly on saved HuggingFace MoE router traces.
+- `download_hf_snapshot.py`: reproducible HuggingFace snapshot downloader for
+  remote experiment machines.
 - `real_ppl_smoke.py`: target-model perplexity smoke test from local HF cache.
 - `summarize_results.py`: writes `SUMMARY.md` and CSV tables.
 - `summarize_iccd_system_results.py`: writes the ICCD-specific energy,
@@ -42,5 +46,6 @@ bash run_suite.sh ~/workspace/spice_iccd_runs/manual_run
 bash run_baseline_stress.sh ~/workspace/spice_iccd_runs/manual_baseline_stress
 bash run_iccd_system_suite.sh ~/workspace/spice_iccd_runs/manual_iccd_system
 GPU=3 bash run_draft_suite.sh ~/workspace/spice_iccd_runs/manual_draft
-python collect_hf_moe_traces.py --model /path/to/local/moe --out_dir ~/workspace/spice_iccd_runs/hf_traces --gpu 3
+python collect_hf_moe_traces.py --model Qwen/Qwen1.5-MoE-A2.7B --out_dir ~/workspace/spice_iccd_runs/qwen_traces --gpu 3 --device_map auto --allow_download
+python eval_hf_trace_prefetch.py --trace_dir ~/workspace/spice_iccd_runs/qwen_traces --out_dir ~/workspace/spice_iccd_runs/qwen_prefetch --top_k 4 --predictor anchor_repeat
 ```

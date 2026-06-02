@@ -57,6 +57,23 @@ def should_capture_router_tensor(tensor: torch.Tensor, min_experts: int, max_exp
     return min_experts <= experts <= max_experts
 
 
+def parse_max_memory(spec: str | None) -> dict[int | str, str] | None:
+    if not spec:
+        return None
+    result: dict[int | str, str] = {}
+    for item in spec.split(","):
+        key, value = item.split("=", maxsplit=1)
+        key = key.strip()
+        result["cpu" if key == "cpu" else int(key)] = value.strip()
+    return result
+
+
+def first_parameter_device(model: torch.nn.Module) -> torch.device:
+    for param in model.parameters():
+        return param.device
+    return torch.device("cpu")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect hidden/router traces from a local HuggingFace MoE model")
     parser.add_argument("--model", required=True, help="HF model id or local model path")
@@ -68,9 +85,13 @@ def main() -> None:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--router_name_regex", default=r"(router|gate|moe.*gate|mlp.*gate)")
+    parser.add_argument("--exclude_name_regex", default=r"(gate_proj|up_proj|down_proj)")
     parser.add_argument("--min_experts", type=int, default=2)
     parser.add_argument("--max_experts", type=int, default=1024)
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
+    parser.add_argument("--device_map", choices=["single", "auto", "cpu"], default="single")
+    parser.add_argument("--max_memory", default=None, help="Comma-separated device=max spec, e.g. 0=20GiB,1=20GiB,cpu=96GiB")
+    parser.add_argument("--offload_folder", default=None)
     parser.add_argument("--allow_download", action="store_true")
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--no_hidden_states", action="store_true")
@@ -92,15 +113,29 @@ def main() -> None:
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype_map[args.dtype],
-        local_files_only=not args.allow_download,
-        trust_remote_code=args.trust_remote_code,
-    ).to(device)
+    load_kwargs = {
+        "torch_dtype": dtype_map[args.dtype],
+        "local_files_only": not args.allow_download,
+        "trust_remote_code": args.trust_remote_code,
+        "low_cpu_mem_usage": True,
+    }
+    max_memory = parse_max_memory(args.max_memory)
+    if args.device_map == "auto":
+        load_kwargs["device_map"] = "auto"
+        if max_memory is not None:
+            load_kwargs["max_memory"] = max_memory
+        if args.offload_folder is not None:
+            load_kwargs["offload_folder"] = args.offload_folder
+    elif args.device_map == "cpu":
+        load_kwargs["device_map"] = {"": "cpu"}
+    model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
+    if args.device_map == "single":
+        model = model.to(device)
     model.eval()
+    input_device = first_parameter_device(model)
 
     name_re = re.compile(args.router_name_regex, flags=re.IGNORECASE)
+    exclude_re = re.compile(args.exclude_name_regex, flags=re.IGNORECASE) if args.exclude_name_regex else None
     active_trace: dict[str, list[Any]] = {"router_logits": [], "router_module_names": []}
     handles = []
 
@@ -116,7 +151,7 @@ def main() -> None:
 
     matched_modules = []
     for name, module in model.named_modules():
-        if name and name_re.search(name):
+        if name and name_re.search(name) and not (exclude_re and exclude_re.search(name)):
             handles.append(module.register_forward_hook(make_hook(name)))
             matched_modules.append(name)
     if not matched_modules:
@@ -126,10 +161,25 @@ def main() -> None:
     manifest = {
         "schema": "spice_hf_moe_trace_v1",
         "model": args.model,
+        "model_config": {
+            key: getattr(model.config, key, None)
+            for key in [
+                "model_type",
+                "num_hidden_layers",
+                "hidden_size",
+                "num_experts",
+                "num_experts_per_tok",
+                "moe_intermediate_size",
+            ]
+        },
         "num_texts": len(texts),
         "batch": args.batch,
         "max_length": args.max_length,
         "router_name_regex": args.router_name_regex,
+        "exclude_name_regex": args.exclude_name_regex,
+        "dtype": args.dtype,
+        "device_map": args.device_map,
+        "max_memory": args.max_memory,
         "matched_modules": matched_modules,
         "trace_files": [],
         "note": (
@@ -147,7 +197,7 @@ def main() -> None:
                 padding=True,
                 truncation=True,
                 max_length=args.max_length,
-            ).to(device)
+            ).to(input_device)
             output = model(**encoded, output_hidden_states=not args.no_hidden_states, return_dict=True)
             router_probs = [torch.softmax(logits, dim=-1) for logits in active_trace["router_logits"]]
             payload = {

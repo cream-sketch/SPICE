@@ -27,6 +27,10 @@ prefetch interfaces with those traces.
   self-correction.
 - `experiments/collect_hf_moe_traces.py`: optional real MoE trace collector for
   local HuggingFace checkpoints.
+- `experiments/eval_hf_trace_prefetch.py`: verified prefetch simulation on
+  saved real-router traces.
+- `experiments/download_hf_snapshot.py`: utility for downloading HF snapshots
+  into a reusable local model directory.
 - `experiments/prefetch_system_sim.py`: controlled prefetch system simulator.
 - `experiments/lossless_correctness.py`: verified-execution correctness check.
 - `experiments/timeline_replay.py`: CUDA H2D overlap replay.
@@ -46,10 +50,17 @@ python eval_draft_prefetch.py \
   --checkpoint runs/draft_train/spice_draft.pt \
   --online_steps 100
 python collect_hf_moe_traces.py \
-  --model /path/to/local/moe \
+  --model Qwen/Qwen1.5-MoE-A2.7B \
   --out_dir runs/hf_traces \
   --text_file prompts.txt \
-  --gpu 0
+  --gpu 0 \
+  --device_map auto \
+  --allow_download
+python eval_hf_trace_prefetch.py \
+  --trace_dir runs/hf_traces \
+  --out_dir runs/hf_trace_prefetch \
+  --top_k 4 \
+  --predictor anchor_repeat
 ```
 
 For GPU workstation runs:

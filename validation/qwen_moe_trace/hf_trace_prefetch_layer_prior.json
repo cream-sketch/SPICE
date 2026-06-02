@@ -1,0 +1,31 @@
+{
+  "avg_lookahead_depth": 5.361653645833333,
+  "cache_capacity": 256,
+  "experiment": "hf_trace_prefetch_eval",
+  "experts_observed": 60,
+  "fallback_slot_rate": 0.6141764322916666,
+  "fallback_slots": 15094,
+  "issued_prefetches": 317,
+  "l_max": 6,
+  "l_min": 2,
+  "layers": 24,
+  "model": "/home/ial-lvyx/workspace/models/Qwen1.5-MoE-A2.7B",
+  "model_config": {
+    "hidden_size": 2048,
+    "model_type": "qwen2_moe",
+    "moe_intermediate_size": 1408,
+    "num_experts": 60,
+    "num_experts_per_tok": 4,
+    "num_hidden_layers": 24
+  },
+  "predicted_slot_attempts": 131768,
+  "predictor": "layer_prior",
+  "prefetch_slot_hit_rate": 0.3858235677083333,
+  "tokens": 256,
+  "top_k": 4,
+  "total_slots": 24576,
+  "trace_dir": "/home/ial-lvyx/workspace/spice/runs/qwen_trace_20260602_16",
+  "trace_files": 16,
+  "wrong_prefetch_rate": 0.7586591585210369,
+  "wrong_prefetches": 99967
+}
