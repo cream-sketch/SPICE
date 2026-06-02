@@ -1,0 +1,54 @@
+{
+  "experiment": "miss_admission_online_qwen",
+  "model": "/home/ziheng/sparmoe/models/Qwen1.5-MoE-A2.7B-Chat",
+  "config": {
+    "capacity": 144,
+    "expert_mb": 17.0,
+    "bandwidth_gbps": 12.0,
+    "fetch_ms": 1.3834635416666667,
+    "max_tokens": 96,
+    "num_texts": 4
+  },
+  "rows": [
+    {
+      "threshold": 4,
+      "ppl": 10.310488860554027,
+      "stall_ms_per_token": 104.0371788872584,
+      "hit_rate": 0.21666124131944445,
+      "fetch_rate": 0.7833387586805556,
+      "drop_rate": 0.0,
+      "dropped_gate_mass_per_token": 0.0,
+      "decode_tokens": 384
+    },
+    {
+      "threshold": 3,
+      "ppl": 10.237968791929635,
+      "stall_ms_per_token": 77.76578267417693,
+      "hit_rate": 0.20694986979166666,
+      "fetch_rate": 0.5855305989583334,
+      "drop_rate": 0.20751953125,
+      "dropped_gate_mass_per_token": 0.8842058181762695,
+      "decode_tokens": 384
+    },
+    {
+      "threshold": 2,
+      "ppl": 10.627047896551767,
+      "stall_ms_per_token": 51.15932888454858,
+      "hit_rate": 0.19373914930555555,
+      "fetch_rate": 0.3851996527777778,
+      "drop_rate": 0.4210611979166667,
+      "dropped_gate_mass_per_token": 2.1367374261220298,
+      "decode_tokens": 384
+    },
+    {
+      "threshold": 1,
+      "ppl": 12.627159201087,
+      "stall_ms_per_token": 24.99601576063395,
+      "hit_rate": 0.17371961805555555,
+      "fetch_rate": 0.1882052951388889,
+      "drop_rate": 0.6380750868055556,
+      "dropped_gate_mass_per_token": 3.984476089477539,
+      "decode_tokens": 384
+    }
+  ]
+}

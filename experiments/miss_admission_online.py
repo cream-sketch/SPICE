@@ -22,9 +22,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 class Controller:
-    def __init__(self, capacity, fetch_ms, threshold, num_layers):
+    def __init__(self, capacity, fetch_ms, threshold, num_layers, policy='gate', rank_keep=4):
         self.capacity = capacity; self.fetch_ms = fetch_ms
         self.threshold = threshold; self.num_layers = num_layers
+        self.policy = policy; self.rank_keep = rank_keep
         self.reset()
     def reset(self):
         self.reset_cache()
@@ -47,13 +48,14 @@ class Controller:
         self.step += 1
         protect = {(layer, e) for e in experts}
         keep = set()
-        for e, w in zip(experts, weights):
+        for rank, (e, w) in enumerate(zip(experts, weights)):
             self.total += 1
             key = (layer, e)
+            admit_ok = (w >= self.threshold) if self.policy == 'gate' else (rank < self.rank_keep)
             if key in self.cache:
                 self.hits += 1; self.cache[key]["last"] = self.step
                 self.cache.move_to_end(key); keep.add(e)
-            elif w >= self.threshold:
+            elif admit_ok:
                 self.fetched += 1; self.stall_ms += self.fetch_ms
                 while len(self.cache) >= self.capacity and self.cache:
                     self._evict(layer, protect)
@@ -128,6 +130,8 @@ def main():
     ap.add_argument("--bandwidth_gbps", type=float, default=12.0)
     ap.add_argument("--t_layer_ms", type=float, default=0.4)
     ap.add_argument("--thresholds", type=str, default="0,0.02,0.05,0.1,0.2,1.0")
+    ap.add_argument("--policy", choices=["gate","rank"], default="gate")
+    ap.add_argument("--rank_keeps", type=str, default="4,3,2,1")
     args = ap.parse_args()
     device = torch.device(f"cuda:{args.gpu}")
     tok = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
@@ -142,8 +146,13 @@ def main():
     fetch_ms = args.expert_mb / (args.bandwidth_gbps * 1024) * 1000.0  # MB / (GB/s*1024 MB/s) *1000 ms
     texts = [l.strip() for l in Path(args.text_file).read_text(encoding="utf-8").splitlines() if l.strip()][:args.max_samples]
     rows = []
-    for th in [float(x) for x in args.thresholds.split(",")]:
-        CTRL = Controller(args.capacity, fetch_ms, th, num_layers)
+    knobs = [float(x) for x in args.thresholds.split(",")] if args.policy=='gate' else [int(x) for x in args.rank_keeps.split(",")]
+    for kn in knobs:
+        if args.policy=='gate':
+            CTRL = Controller(args.capacity, fetch_ms, kn, num_layers, policy='gate')
+        else:
+            CTRL = Controller(args.capacity, fetch_ms, -1.0, num_layers, policy='rank', rank_keep=kn)
+        th = kn
         nll_tot = 0.0; ntok = 0
         for text in texts:
             CTRL.reset_cache()  # per-text cold cache
