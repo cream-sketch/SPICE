@@ -21,3 +21,7 @@ tmp*/
 venv/
 env/
 *.egg-info/
+
+# papers and codex run logs (local only)
+*.pdf
+notes/codex_run_*.log
