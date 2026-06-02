@@ -17,7 +17,10 @@ generate synthetic routing traces.
 - `train_draft_model.py`: trains the LoRE draft predictor on target-generated
   routing distributions and hidden states.
 - `eval_draft_prefetch.py`: evaluates draft-model-driven adaptive prefetching
-  with verified fallback and optional online self-correction.
+  with anchor re-initialized lookahead, verified fallback, and optional online
+  self-correction.
+- `collect_hf_moe_traces.py`: captures hidden states and router logits/probs
+  from a local HuggingFace MoE checkpoint for model-specific draft wrappers.
 - `real_ppl_smoke.py`: target-model perplexity smoke test from local HF cache.
 - `summarize_results.py`: writes `SUMMARY.md` and CSV tables.
 - `summarize_iccd_system_results.py`: writes the ICCD-specific energy,
@@ -39,4 +42,5 @@ bash run_suite.sh ~/workspace/spice_iccd_runs/manual_run
 bash run_baseline_stress.sh ~/workspace/spice_iccd_runs/manual_baseline_stress
 bash run_iccd_system_suite.sh ~/workspace/spice_iccd_runs/manual_iccd_system
 GPU=3 bash run_draft_suite.sh ~/workspace/spice_iccd_runs/manual_draft
+python collect_hf_moe_traces.py --model /path/to/local/moe --out_dir ~/workspace/spice_iccd_runs/hf_traces --gpu 3
 ```

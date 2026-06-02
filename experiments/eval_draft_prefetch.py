@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from pathlib import Path
 
@@ -39,11 +40,21 @@ def l_min_from_hardware(top_k: int, expert_mb: int, pcie_gbps: float, compute_ms
     window_gb = pcie_gbps * (compute_ms / 1000.0)
     if window_gb <= 0:
         return 1
-    return max(1, int((top_k * expert_gb + window_gb - 1e-12) // window_gb))
+    return max(1, math.ceil((top_k * expert_gb) / window_gb))
 
 
 def mean_topk_conf(conf: torch.Tensor) -> float:
     return float(conf.detach().float().mean().item())
+
+
+@torch.no_grad()
+def context_from_observed_routes(draft, target_route_probs: list[torch.Tensor], upto_layer: int) -> torch.Tensor:
+    batch = target_route_probs[0].shape[0]
+    device = target_route_probs[0].device
+    context = draft.initial_context(batch, device)
+    for layer in range(upto_layer):
+        context = draft.update_context(target_route_probs[layer], context)
+    return context
 
 
 @torch.no_grad()
@@ -93,6 +104,8 @@ def eval_verified_prefetch(
     pcie_gbps: float,
     compute_ms: float,
     device: torch.device,
+    anchor_reinit: bool = True,
+    observed_route_history: bool = True,
 ) -> dict:
     cache = LRUCache(cache_capacity)
     total_slots = 0
@@ -109,21 +122,39 @@ def eval_verified_prefetch(
     for _ in range(steps):
         x = sample_batch(batch, target.cfg.hidden, device)
         target_out = target(x)
-        draft_out = draft(x)
         target_sets = [topk_sets(t) for t in target_out["topk_indices"]]
-        pred_sets = [topk_sets(p) for p in draft_out["topk_indices"]]
+        if anchor_reinit:
+            full_draft_out = None
+            full_pred_sets = None
+        else:
+            full_draft_out = draft(x)
+            full_pred_sets = [topk_sets(p) for p in full_draft_out["topk_indices"]]
 
         for anchor in range(target.cfg.layers):
+            if anchor_reinit:
+                anchor_hidden = x if anchor == 0 else target_out["hidden_states"][anchor - 1]
+                if observed_route_history:
+                    context = context_from_observed_routes(draft, target_out["route_probs"], anchor)
+                else:
+                    context = None
+                draft_out = draft(anchor_hidden, start_layer=anchor, context=context)
+                pred_sets = [topk_sets(p) for p in draft_out["topk_indices"]]
+            else:
+                assert full_draft_out is not None and full_pred_sets is not None
+                draft_out = full_draft_out
+                pred_sets = full_pred_sets
+
             depth = 0
             for future in range(anchor, min(target.cfg.layers, anchor + l_max)):
                 depth += 1
-                conf = mean_topk_conf(draft_out["confidences"][future])
+                draft_index = future - anchor if anchor_reinit else future
+                conf = mean_topk_conf(draft_out["confidences"][draft_index])
                 confidence_by_depth.setdefault(str(depth), []).append(conf)
                 for b in range(batch):
-                    for e in pred_sets[future][b]:
+                    for e in pred_sets[draft_index][b]:
                         predicted_slot_attempts += 1
                         issued_prefetches += int(cache.add((future, e)))
-                    wrong_prefetches += len(pred_sets[future][b].difference(target_sets[future][b]))
+                    wrong_prefetches += len(pred_sets[draft_index][b].difference(target_sets[future][b]))
                 if depth >= l_min and conf < confidence_threshold:
                     break
             depth_sum += depth
@@ -161,6 +192,8 @@ def eval_verified_prefetch(
         "expert_mb": expert_mb,
         "pcie_gbps": pcie_gbps,
         "compute_ms": compute_ms,
+        "anchor_reinit": anchor_reinit,
+        "observed_route_history": observed_route_history,
         "total_slots": total_slots,
         "prefetch_slot_hit_rate": hit_slots / max(1, total_slots),
         "fallback_slot_rate": fallback_slots / max(1, total_slots),
@@ -223,6 +256,8 @@ def main() -> None:
     parser.add_argument("--l_min", type=int, default=0)
     parser.add_argument("--l_max", type=int, default=6)
     parser.add_argument("--confidence_threshold", type=float, default=0.7)
+    parser.add_argument("--no_anchor_reinit", action="store_true")
+    parser.add_argument("--no_observed_route_history", action="store_true")
     parser.add_argument("--online_steps", type=int, default=0)
     parser.add_argument("--online_lr", type=float, default=5e-5)
     parser.add_argument("--align_lambda", type=float, default=0.1)
@@ -250,6 +285,8 @@ def main() -> None:
         pcie_gbps=args.pcie_gbps,
         compute_ms=args.compute_ms,
         device=device,
+        anchor_reinit=not args.no_anchor_reinit,
+        observed_route_history=not args.no_observed_route_history,
     )
     result = {
         "experiment": "spice_draft_prefetch_eval",

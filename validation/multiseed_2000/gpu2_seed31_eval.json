@@ -1,0 +1,142 @@
+{
+  "after_online": {
+    "align_mse": 7.595702916383743,
+    "exact_set_match_rate": 0.27392578125,
+    "fallback_slot_rate": 0.49658203125,
+    "mean_confidence": 0.5838807737454772,
+    "route_kl": 1.0388180557638407,
+    "slot_hit_rate": 0.50341796875
+  },
+  "before_online": {
+    "align_mse": 7.7536677569150925,
+    "exact_set_match_rate": 0.279296875,
+    "fallback_slot_rate": 0.48486328125,
+    "mean_confidence": 0.5935972521547228,
+    "route_kl": 1.0536204557865858,
+    "slot_hit_rate": 0.51513671875
+  },
+  "checkpoint": "/home/ial-lvyx/workspace/spice/runs/draft_parallel_extra_20260602_175236/gpu2_seed31/train/spice_draft.pt",
+  "checkpoint_extra": {
+    "align_lambda": 0.1,
+    "final_eval": {
+      "align_mse": 8.02823369204998,
+      "exact_set_match_rate": 0.26220703125,
+      "fallback_slot_rate": 0.4990234375,
+      "mean_confidence": 0.5855199879733846,
+      "route_kl": 1.0317860636860132,
+      "slot_hit_rate": 0.5009765625
+    },
+    "initial_eval": {
+      "align_mse": 7.7955824583768845,
+      "exact_set_match_rate": 0.27880859375,
+      "fallback_slot_rate": 0.485107421875,
+      "mean_confidence": 0.6010595459956676,
+      "route_kl": 1.1025726981461048,
+      "slot_hit_rate": 0.514892578125
+    },
+    "train_steps": 2000
+  },
+  "config": {
+    "expert_hidden": 512,
+    "experts": 16,
+    "hidden": 256,
+    "history": "gru",
+    "layers": 8,
+    "rank": 16,
+    "route_context": 64,
+    "shared_down": true,
+    "top_k": 2
+  },
+  "correctness_invariant": "Draft predictions only issue prefetches; target router selections are verified, and missing target experts are synchronously fetched before execution.",
+  "device": "cuda:2",
+  "experiment": "spice_draft_prefetch_eval",
+  "online_logs": [
+    {
+      "align_mse": 7.950847625732422,
+      "exact_set_match_rate": 0.296875,
+      "fallback_slot_rate": 0.453125,
+      "loss": 1.9054489135742188,
+      "mean_confidence": 0.5561557039618492,
+      "route_kl": 1.1103640794754028,
+      "slot_hit_rate": 0.546875,
+      "step": 25
+    },
+    {
+      "align_mse": 8.074792861938477,
+      "exact_set_match_rate": 0.296875,
+      "fallback_slot_rate": 0.4609375,
+      "loss": 1.9661099910736084,
+      "mean_confidence": 0.5860135704278946,
+      "route_kl": 1.158630609512329,
+      "slot_hit_rate": 0.5390625,
+      "step": 50
+    },
+    {
+      "align_mse": 7.858486652374268,
+      "exact_set_match_rate": 0.25,
+      "fallback_slot_rate": 0.484375,
+      "loss": 1.6725435256958008,
+      "mean_confidence": 0.5528173819184303,
+      "route_kl": 0.8866949081420898,
+      "slot_hit_rate": 0.515625,
+      "step": 75
+    },
+    {
+      "align_mse": 7.019776821136475,
+      "exact_set_match_rate": 0.296875,
+      "fallback_slot_rate": 0.515625,
+      "loss": 1.664616584777832,
+      "mean_confidence": 0.5927360467612743,
+      "route_kl": 0.9626388549804688,
+      "slot_hit_rate": 0.484375,
+      "step": 100
+    }
+  ],
+  "verified_prefetch": {
+    "avg_lookahead_depth": 1.9326171875,
+    "batch": 8,
+    "cache_capacity": 64,
+    "compute_ms": 2.5,
+    "confidence_by_depth": {
+      "1": {
+        "count": 2048,
+        "mean": 0.5838295084686251
+      },
+      "2": {
+        "count": 1792,
+        "mean": 0.6022199591222618
+      },
+      "3": {
+        "count": 109,
+        "mean": 0.6492492972163979
+      },
+      "4": {
+        "count": 9,
+        "mean": 0.6706200838088989
+      }
+    },
+    "confidence_threshold": 0.7,
+    "depth_hist": {
+      "1": 256,
+      "2": 1683,
+      "3": 100,
+      "4": 9
+    },
+    "expert_mb": 64,
+    "fallback_slot_rate": 0.1424560546875,
+    "fallback_slots": 4668,
+    "issued_prefetches": 21349,
+    "l_max": 6,
+    "l_min": 2,
+    "pcie_gbps": 48.0,
+    "predicted_slot_attempts": 63328,
+    "prefetch_slot_hit_rate": 0.8575439453125,
+    "sim_stall_ms": 6078.125,
+    "sim_total_ms": 11321.005,
+    "sim_tpot_ms": 44.22267578125,
+    "steps": 256,
+    "total_slots": 32768,
+    "wrong_prefetch_rate": 0.5222492420414351,
+    "wrong_prefetches": 33073
+  }
+}

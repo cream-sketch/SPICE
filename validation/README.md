@@ -26,6 +26,8 @@ Result files:
 
 - `draft_train_800.json`
 - `draft_prefetch_eval_fixed.json`
+- `anchored_eval_20260602_fix.json`
+- `multiseed_2000/`
 
 This run validates the non-proxy SPICE draft-model code path:
 
@@ -49,5 +51,22 @@ Key metrics from the fixed evaluation:
 - Verified fallback slot rate: `0.142944`
 - Corrected wrong-prefetch rate: `0.519211`
 - Average lookahead depth: `1.944336`
+
+The anchored evaluation validates the paper-style re-initialization path: after
+each verified target layer, the draft rollout restarts from the target hidden
+state and uses observed target routing history as context.
+
+Key metrics from `anchored_eval_20260602_fix.json`:
+
+- Checkpoint: seed13, 2000 training steps
+- Anchor re-initialization: `true`
+- Observed routing history context: `true`
+- Verified prefetch hit rate: `0.992432`
+- Verified fallback slot rate: `0.007568`
+- Wrong-prefetch rate: `0.253079`
+- Average lookahead depth: `2.378906`
+
+The four-GPU multiseed run in `multiseed_2000/` validates reproducibility across
+seeds 7, 13, 23, and 31 at 2000 draft-training steps.
 
 Checkpoints and logs are intentionally not committed.
