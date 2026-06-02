@@ -1,0 +1,47 @@
+{
+  "model": "/data/ziheng/hf_cache/models--deepseek-ai--DeepSeek-V2-Lite-Chat/snapshots/85864749cd611b4353ce1decdb286193298f64c7",
+  "rows": [
+    {
+      "policy": "gate",
+      "knob": 0.0,
+      "drop_rate": 0.0,
+      "ppl": 15.689344919819659
+    },
+    {
+      "policy": "rank",
+      "knob": 0,
+      "drop_rate": 0.0,
+      "ppl": 15.689344919819659
+    },
+    {
+      "policy": "mass",
+      "knob": 0.85,
+      "drop_rate": 0.21203519727504969,
+      "ppl": 16.061292156884384
+    },
+    {
+      "policy": "mass",
+      "knob": 0.8,
+      "drop_rate": 0.2809067883578244,
+      "ppl": 16.412628116020436
+    },
+    {
+      "policy": "mass",
+      "knob": 0.7,
+      "drop_rate": 0.4131567647037417,
+      "ppl": 17.173310447007836
+    },
+    {
+      "policy": "mass",
+      "knob": 0.6,
+      "drop_rate": 0.5225459798976688,
+      "ppl": 18.1215517082941
+    },
+    {
+      "policy": "mass",
+      "knob": 0.5,
+      "drop_rate": 0.610504596170222,
+      "ppl": 19.498933739576263
+    }
+  ]
+}
