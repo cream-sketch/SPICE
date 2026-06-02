@@ -19,6 +19,11 @@ prefetch interfaces with those traces.
 
 ## Repository Layout
 
+- `experiments/`: runnable code for draft training, prefetch simulation,
+  Qwen/HuggingFace trace collection, and hardware replay.
+- `validation/`: compact JSON/CSV/Markdown experiment summaries. Large traces,
+  checkpoints, model weights, logs, and profiler reports are intentionally
+  excluded from git.
 - `experiments/draft_model.py`: target MoE, SPICE LoRE draft model, losses, and
   routing metrics.
 - `experiments/train_draft_model.py`: offline draft-model training.

@@ -9,6 +9,8 @@ Result files:
 
 - `device3_system_SUMMARY.md`
 - `device3_prefetch_system_summary.csv`
+- `baseline_stress_results.md`
+- `iccd_system_results.md`
 
 The device3 run reproduced the verified correctness harness, prefetch-system
 simulation, cache sweep, top-k stress, timeline replay, and energy replay.

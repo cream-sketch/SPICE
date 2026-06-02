@@ -106,26 +106,7 @@ def main() -> None:
             )
         lines.append("\n")
 
-    latex = []
-    latex.append("% Paste-ready ICCD system supplement. Requires \\usepackage{booktabs}.\n\n")
-    if energy_rows:
-        df = pd.DataFrame(energy_rows).sort_values(["policy"])
-        latex.append("\\begin{table}[t]\n\\centering\n\\caption{Hardware replay energy telemetry for offloaded MoE serving. Lower J/token is better.}\n\\label{tab:energy_replay}\n\\scriptsize\n\\begin{tabular}{lrrrr}\n\\toprule\nPolicy & TPOT (ms) & Avg W & Peak W & J/token \\\\\n\\midrule\n")
-        for _, r in df.iterrows():
-            name = str(r.policy).replace("_", "-")
-            latex.append(f"{name} & {f2(r.measured_tpot_ms)} & {f2(r.avg_power_w)} & {f2(r.peak_power_w)} & {f2(r.energy_per_token_j)} \\\\\n")
-        latex.append("\\bottomrule\n\\end{tabular}\n\\end{table}\n\n")
-    if cache_rows:
-        df = pd.DataFrame(cache_rows)
-        focus = df[df["policy"].isin(["lru", "pregated", "spice"])].copy()
-        pivot = focus.pivot_table(index="cache_capacity", columns="policy", values="sim_tpot_ms", aggfunc="first")
-        latex.append("\\begin{table}[t]\n\\centering\n\\caption{Cache-budget sensitivity under fixed Top-$K{=}6$. All methods use the same expert-transfer model. Lower TPOT is better.}\n\\label{tab:cache_budget}\n\\scriptsize\n\\begin{tabular}{rrrr}\n\\toprule\nCache slots & LRU & Pre-gated & SPICE \\\\\n\\midrule\n")
-        for cap, row in pivot.sort_index().iterrows():
-            latex.append(f"{int(cap)} & {f2(row.get('lru'))} & {f2(row.get('pregated'))} & {f2(row.get('spice'))} \\\\\n")
-        latex.append("\\bottomrule\n\\end{tabular}\n\\end{table}\n\n")
-    latex.append("\\textbf{System telemetry.} We add two ICCD-oriented measurements: a hardware replay for energy-per-token telemetry and a cache-budget sweep for memory-constrained serving. These experiments use synthetic routing traces and do not transfer datasets. Table~\\ref{tab:energy_replay} shows that SPICE reduces replay energy relative to Naive offloading, but it does not dominate every cache-based baseline; we therefore avoid claiming universal energy reduction. Table~\\ref{tab:cache_budget} shows that SPICE is most useful in the memory-constrained region (256--512 cache slots), where verified prefetching reduces fallback traffic without requiring the large resident expert set needed by cache-only policies. When the cache budget is large enough to hold most hot experts, all methods converge and the advantage naturally disappears.\n")
     (root / "ICCD_SYSTEM_RESULTS.md").write_text("".join(lines), encoding="utf-8")
-    (root / "overleaf_iccd_system_results.tex").write_text("".join(latex), encoding="utf-8")
     print(root / "ICCD_SYSTEM_RESULTS.md")
 
 

@@ -1,9 +1,8 @@
-# SPICE ICCD Supplemental Experiments
+# SPICE Experiments
 
-This code supplements reviewer-requested evidence for the SPICE resubmission.
-It intentionally transfers no datasets from the local machine to the GPU
-workstation. Scripts either use local Hugging Face cache on the workstation or
-generate synthetic routing traces.
+This directory contains runnable SPICE experiment code. Scripts either use
+local HuggingFace cache/model paths on the workstation or generate synthetic
+routing traces.
 
 ## Scripts
 
@@ -27,8 +26,8 @@ generate synthetic routing traces.
   remote experiment machines.
 - `real_ppl_smoke.py`: target-model perplexity smoke test from local HF cache.
 - `summarize_results.py`: writes `SUMMARY.md` and CSV tables.
-- `summarize_iccd_system_results.py`: writes the ICCD-specific energy,
-  cache-budget, and timeline summary plus paste-ready LaTeX.
+- `summarize_iccd_system_results.py`: writes energy, cache-budget, and timeline
+  Markdown/CSV summaries.
 - `run_suite.sh`: single-machine run for the four GPU workstation.
 - `run_baseline_stress.sh`: four-GPU Top-K stress matrix comparing Naive,
   LRU, MoE-Offloading, Pre-gated, and SPICE under the same tight cache budget.

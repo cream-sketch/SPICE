@@ -48,4 +48,3 @@ Root: `F:\ICCD\SPICE\experiments\results\iccd_system_20260528_121027`
 | naive | False | 36.00 | 1.10 | 32.69 | `gpu3_timeline\naive\timeline_naive.nsys-rep` |
 | pregated | True | 15.00 | 0.45 | 33.23 | `gpu3_timeline\pregated\timeline_pregated.nsys-rep` |
 | spice | True | 18.00 | 0.51 | 35.06 | `gpu3_timeline\spice\timeline_spice.nsys-rep` |
-

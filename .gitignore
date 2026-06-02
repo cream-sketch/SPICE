@@ -15,6 +15,7 @@ tmp*/
 *.nsys-rep
 *.sqlite
 *.log
+*.tex
 
 .venv/
 venv/
