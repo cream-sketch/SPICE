@@ -31,3 +31,10 @@ LESSON: must compare at MATCHED drop rate; unmatched points misled me into a pre
 | ~62% | 26.8 / 16.92 | 25.2 / 18.35 | PPL -1.44 |
 | ~20% | 71 / 14.31 | 77 / 14.21 | ~tied (low-drop region) |
 Conclusion: verified gate-weight thresholding Pareto-dominates fixed rank-dropping at matched drop, clearly in the mid-high region. The verified per-token gate-weight novelty vs SpecMD drop-by-rank HOLDS. (16 texts x 96 tokens, Qwen 10% cache/bw12.)
+
+## DeepSeek-V2-Lite generalization (24 texts, full-seq teacher-forced) -- gate>rank does NOT generalize
+gate: thr0.02->0.9% drop/15.73 PPL; thr0.05->44.1%/16.81; thr0.10->82%/25.69 (bimodal weights -> coarse drop control)
+rank: n1->16.7%/15.90; n2->33.3%/16.40; n3->50%/17.32; n4->66.7%/19.87
+Matched: ~33% rank 16.40 vs gate ~16.53; ~50% rank 17.32 vs gate ~18.19 -> RANK slightly better at high drop on DeepSeek.
+INFERENCE: DeepSeek routing is near winner-take-all (rank-1~=0.96 gate mass) -> rank order == weight order, and discrete rank gives finer drop control -> gate has no advantage. The "verified gate-weight > rank" novelty is MODEL-DEPENDENT: holds for spread-routing MoE (Qwen top-4) NOT winner-take-all (DeepSeek top-6).
+DIRECTION UPDATE: miss-handling DROP lever generalizes (cheap drop both models) BUT the gate>rank differentiator does NOT -> lossy miss-handling alone looks incremental (lever known to SpecMD/AdapMoE; the one differentiator is model-specific). Non-incrementality now hinges on D (miss-shadow oracle) / C (bandit) / a NEW signal-decision coupling.

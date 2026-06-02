@@ -1,0 +1,65 @@
+{
+  "model": "/data/ziheng/hf_cache/models--deepseek-ai--DeepSeek-V2-Lite-Chat/snapshots/85864749cd611b4353ce1decdb286193298f64c7",
+  "rows": [
+    {
+      "policy": "gate",
+      "knob": 0.0,
+      "drop_rate": 0.0,
+      "ppl": 15.689344919819659
+    },
+    {
+      "policy": "gate",
+      "knob": 0.02,
+      "drop_rate": 0.00937793401602655,
+      "ppl": 15.727547532771359
+    },
+    {
+      "policy": "gate",
+      "knob": 0.05,
+      "drop_rate": 0.44060095926403053,
+      "ppl": 16.813088348111894
+    },
+    {
+      "policy": "gate",
+      "knob": 0.1,
+      "drop_rate": 0.8207129704433139,
+      "ppl": 25.692199509268214
+    },
+    {
+      "policy": "gate",
+      "knob": 0.2,
+      "drop_rate": 0.9956713028668748,
+      "ppl": 3572150.8342860383
+    },
+    {
+      "policy": "rank",
+      "knob": 0,
+      "drop_rate": 0.0,
+      "ppl": 15.689344919819659
+    },
+    {
+      "policy": "rank",
+      "knob": 1,
+      "drop_rate": 0.16666666666666666,
+      "ppl": 15.900424898317464
+    },
+    {
+      "policy": "rank",
+      "knob": 2,
+      "drop_rate": 0.3333333333333333,
+      "ppl": 16.399329734270086
+    },
+    {
+      "policy": "rank",
+      "knob": 3,
+      "drop_rate": 0.5,
+      "ppl": 17.32189666966768
+    },
+    {
+      "policy": "rank",
+      "knob": 4,
+      "drop_rate": 0.6666666666666666,
+      "ppl": 19.865894116148986
+    }
+  ]
+}
