@@ -1,0 +1,74 @@
+{
+  "experiment": "miss_admission_online_qwen",
+  "model": "/home/ziheng/sparmoe/models/Qwen1.5-MoE-A2.7B-Chat",
+  "config": {
+    "capacity": 144,
+    "expert_mb": 17.0,
+    "bandwidth_gbps": 12.0,
+    "fetch_ms": 1.3834635416666667,
+    "max_tokens": 96,
+    "num_texts": 16
+  },
+  "rows": [
+    {
+      "threshold": 0.0,
+      "ppl": 14.175492494387845,
+      "stall_ms_per_token": 102.94261526257053,
+      "hit_rate": 0.22490266155276614,
+      "fetch_rate": 0.7750973384472338,
+      "drop_rate": 0.0,
+      "dropped_gate_mass_per_token": 0.0,
+      "decode_tokens": 1434
+    },
+    {
+      "threshold": 0.035,
+      "ppl": 14.238680801465877,
+      "stall_ms_per_token": 91.37709159633336,
+      "hit_rate": 0.22182269874476987,
+      "fetch_rate": 0.6880157484890749,
+      "drop_rate": 0.09016155276615527,
+      "dropped_gate_mass_per_token": 0.24904176081573615,
+      "decode_tokens": 1434
+    },
+    {
+      "threshold": 0.05,
+      "ppl": 14.31343893896699,
+      "stall_ms_per_token": 71.09690532752097,
+      "hit_rate": 0.21551749186424918,
+      "fetch_rate": 0.5353178754067875,
+      "drop_rate": 0.24916463272896328,
+      "dropped_gate_mass_per_token": 0.8942914933506582,
+      "decode_tokens": 1434
+    },
+    {
+      "threshold": 0.07,
+      "ppl": 14.183516998986386,
+      "stall_ms_per_token": 50.77041065564008,
+      "hit_rate": 0.20436715481171547,
+      "fetch_rate": 0.38227132728963276,
+      "drop_rate": 0.4133615178986518,
+      "dropped_gate_mass_per_token": 1.8147020113850572,
+      "decode_tokens": 1434
+    },
+    {
+      "threshold": 0.1,
+      "ppl": 15.171981784355685,
+      "stall_ms_per_token": 32.9320278903611,
+      "hit_rate": 0.19235239423523942,
+      "fetch_rate": 0.24795879823337982,
+      "drop_rate": 0.5596888075313807,
+      "dropped_gate_mass_per_token": 2.9691015693100593,
+      "decode_tokens": 1434
+    },
+    {
+      "threshold": 0.115,
+      "ppl": 16.916402665825288,
+      "stall_ms_per_token": 26.772045523885378,
+      "hit_rate": 0.1870423640167364,
+      "fetch_rate": 0.20157775453277546,
+      "drop_rate": 0.6113798814504882,
+      "dropped_gate_mass_per_token": 3.495819006671134,
+      "decode_tokens": 1434
+    }
+  ]
+}

@@ -23,3 +23,11 @@ LESSON: must compare at MATCHED drop rate; unmatched points misled me into a pre
 1. Bigger-sample gate-vs-rank (30+ texts, 128 tokens) to confirm domination + significance.
 2. DeepSeek-V2-Lite same ablation (generalization).
 3. Gate A (miss-shadow recovery) + Gate B (bandit vs tuned static) -- the novelty-critical unvalidated pillars.
+
+## CONFIRMED at n=16 texts (cleaner, near-monotonic)
+| matched drop% | gate stall/PPL | rank stall/PPL | gate advantage |
+|---|---|---|---|
+| ~41% | 50.8 / 14.18 | 50.8 / 14.78 | same stall, PPL -0.60 |
+| ~62% | 26.8 / 16.92 | 25.2 / 18.35 | PPL -1.44 |
+| ~20% | 71 / 14.31 | 77 / 14.21 | ~tied (low-drop region) |
+Conclusion: verified gate-weight thresholding Pareto-dominates fixed rank-dropping at matched drop, clearly in the mid-high region. The verified per-token gate-weight novelty vs SpecMD drop-by-rank HOLDS. (16 texts x 96 tokens, Qwen 10% cache/bw12.)
