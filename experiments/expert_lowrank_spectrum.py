@@ -81,7 +81,8 @@ def spectrum_stats(singular_values: torch.Tensor, fixed_ranks: list[int], energy
     energy = sv * sv
     total = float(energy.sum().item())
     full_rank = int(sv.numel())
-    cumulative = torch.cumsum(energy, dim=0) / max(total, 1e-12)
+    # 累计能量谱移到 cpu 做标量查询 (尺寸 <= full_rank, 开销可忽略)
+    cumulative = (torch.cumsum(energy, dim=0) / max(total, 1e-12)).cpu()
 
     rank_for_energy: dict[str, int] = {}
     for target in energy_targets:
