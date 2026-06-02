@@ -138,7 +138,7 @@ def simulate_text(text: dict, seq_len: int, num_layers: int, top_k: int, horizon
                     horizon_d = max(1, cur_layer_forecast[k] - cur_layer)
                     return 1000.0 + 1.0 / horizon_d   # predicted very soon this token -> protect
                 return float(layer_freq.get(k, 0))     # else cross-token frequency prior
-            victim = min(candidates, key=lambda k: (keep_value(k), -cache[k]["last"]))
+            victim = min(candidates, key=lambda k: (keep_value(k), cache[k]["last"]))
         else:
             raise ValueError(evict)
         ent = cache.pop(victim)
