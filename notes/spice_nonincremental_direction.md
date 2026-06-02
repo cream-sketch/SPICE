@@ -1,3 +1,11 @@
+# >>> v3 更正 (2026-06-02, 读完 SPICE 原论文后) <<<
+# 重大更正: SPICE 的 LoRE 是路由预测的"低秩状态转移" E(z)=z+BAz, 不是近似专家输出, 也不是专家权重低秩.
+# 因此: (a) 实验0a(专家权重满秩)对 SPICE 无杀伤, 仅排除"近似专家输出"误读; (b) codex 重构里"代理只调度路由不近似输出"SPICE 已实现, 非新贡献.
+# 新的非增量靶子 = SPICE 自己暴露的弱点 (论文 Table VI/III): 小 cache 预算下输给 LRU; H2D 198GB 极吃带宽; 无 eviction 设计; miss 只阻塞补取; batch>1 缺失; 漏比 FineMoE/HOBBIT.
+# 拟定主张: 让 speculative prefetch 在 "紧内存+紧带宽" 真实 offloading regime 可用 (predictor 预测驱动的 eviction + 带宽感知 speculation throttle + miss-window 调度), 保留 lossless verification.
+# 修正前提后已重新咨询 codex: notes/codex_query_direction_v2.md -> notes/codex_run_direction_v3.log. 待其结论再定稿.
+# 以下 §2-§6 中关于 (B) "低秩近似输出" 的部分按上面更正理解, 不再作为路线.
+
 # SPICE 非增量方向与实验路线（v2, 2026-06-02，codex 复核后）
 
 依据：6 篇 paper + SOTA SpecMD(Apple 2602.03921) + codex 独立评估(`notes/codex_direction_assessment_v1.md`) + 实验0a 实测。
