@@ -157,6 +157,8 @@ def main() -> None:
     parser.add_argument("--max_horizon", type=int, default=6)
     parser.add_argument("--max_samples", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=128)
+    parser.add_argument("--dump_forecast", default=None,
+                        help="if set, dump per-text true routing + draft forecast tensors to this dir")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -174,10 +176,29 @@ def main() -> None:
     horizon_recall_anchor: dict[int, list[float]] = {}
     horizon_recall_prior: dict[int, list[float]] = {}
 
-    for text in texts:
+    dump_dir = Path(args.dump_forecast) if args.dump_forecast else None
+    dump_files: list[str] = []
+    if dump_dir:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+    for ti, text in enumerate(texts):
         enc = tok(text, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
         true_topk, hs = true_forward(model, enc["input_ids"], enc.get("attention_mask"), args.top_k)
         preds, num_layers = draft_rollout_predict(model, hs, enc.get("attention_mask"), args.top_k, args.max_horizon)
+
+        if dump_dir:
+            # true_top [L, S, top_k]; fcast [L_anchor, H, S, top_k] (target=anchor+h; -1 padded)
+            s = true_topk[0].shape[0]
+            true_top = torch.stack([t.cpu() for t in true_topk], dim=0)  # [L,S,k]
+            fcast = torch.full((num_layers, args.max_horizon, s, args.top_k), -1, dtype=torch.long)
+            for (anchor, target), pred_ids in preds.items():
+                h = target - anchor
+                if h < args.max_horizon:
+                    fcast[anchor, h] = pred_ids.cpu()
+            fname = f"fc_{ti:05d}.pt"
+            torch.save({"true_top": true_top, "fcast": fcast, "num_layers": num_layers,
+                        "top_k": args.top_k, "max_horizon": args.max_horizon}, dump_dir / fname)
+            dump_files.append(fname)
 
         # running layer prior (frequency of experts per layer) for layer_prior baseline
         n_experts = int(model.config.num_experts)
@@ -217,6 +238,12 @@ def main() -> None:
     Path(args.out).write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result["recall_at_k_by_horizon"], indent=2))
     print(f"[done] wrote {args.out}")
+
+    if dump_dir:
+        (dump_dir / "manifest.json").write_text(
+            json.dumps({"files": dump_files, "top_k": args.top_k, "max_horizon": args.max_horizon,
+                        "model_dir": args.model_dir}, indent=2), encoding="utf-8")
+        print(f"[dump] {len(dump_files)} forecast files -> {dump_dir}")
 
 
 if __name__ == "__main__":
