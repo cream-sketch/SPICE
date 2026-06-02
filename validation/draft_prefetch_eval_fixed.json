@@ -1,0 +1,147 @@
+{
+  "after_online": {
+    "align_mse": 7.799106180667877,
+    "exact_set_match_rate": 0.265625,
+    "fallback_slot_rate": 0.49658203125,
+    "mean_confidence": 0.5931390749756247,
+    "route_kl": 1.066346038132906,
+    "slot_hit_rate": 0.50341796875
+  },
+  "before_online": {
+    "align_mse": 7.76737916469574,
+    "exact_set_match_rate": 0.275390625,
+    "fallback_slot_rate": 0.4970703125,
+    "mean_confidence": 0.6032662047073245,
+    "route_kl": 1.0825434178113937,
+    "slot_hit_rate": 0.5029296875
+  },
+  "checkpoint": "/home/ial-lvyx/workspace/spice/runs/draft_full_20260602_173517/train/spice_draft.pt",
+  "checkpoint_extra": {
+    "align_lambda": 0.1,
+    "final_eval": {
+      "align_mse": 7.523784190416336,
+      "exact_set_match_rate": 0.2841796875,
+      "fallback_slot_rate": 0.4794921875,
+      "mean_confidence": 0.592140004504472,
+      "route_kl": 1.070175588130951,
+      "slot_hit_rate": 0.5205078125
+    },
+    "initial_eval": {
+      "align_mse": 7.777107000350952,
+      "exact_set_match_rate": 0.2666015625,
+      "fallback_slot_rate": 0.50048828125,
+      "mean_confidence": 0.6051780472043902,
+      "route_kl": 1.0955255515873432,
+      "slot_hit_rate": 0.49951171875
+    },
+    "train_steps": 800
+  },
+  "config": {
+    "expert_hidden": 512,
+    "experts": 16,
+    "hidden": 256,
+    "history": "gru",
+    "layers": 8,
+    "rank": 16,
+    "route_context": 64,
+    "shared_down": true,
+    "top_k": 2
+  },
+  "correctness_invariant": "Draft predictions only issue prefetches; target router selections are verified, and missing target experts are synchronously fetched before execution.",
+  "device": "cuda:3",
+  "experiment": "spice_draft_prefetch_eval",
+  "online_logs": [
+    {
+      "align_mse": 7.706956386566162,
+      "exact_set_match_rate": 0.265625,
+      "fallback_slot_rate": 0.484375,
+      "loss": 1.8483047485351562,
+      "mean_confidence": 0.5955363772809505,
+      "route_kl": 1.0776090621948242,
+      "slot_hit_rate": 0.515625,
+      "step": 25
+    },
+    {
+      "align_mse": 7.649374008178711,
+      "exact_set_match_rate": 0.234375,
+      "fallback_slot_rate": 0.515625,
+      "loss": 1.8584882020950317,
+      "mean_confidence": 0.5878087356686592,
+      "route_kl": 1.0935508012771606,
+      "slot_hit_rate": 0.484375,
+      "step": 50
+    },
+    {
+      "align_mse": 8.092178344726562,
+      "exact_set_match_rate": 0.3125,
+      "fallback_slot_rate": 0.4609375,
+      "loss": 1.8127779960632324,
+      "mean_confidence": 0.5838629752397537,
+      "route_kl": 1.0035600662231445,
+      "slot_hit_rate": 0.5390625,
+      "step": 75
+    },
+    {
+      "align_mse": 7.840117931365967,
+      "exact_set_match_rate": 0.296875,
+      "fallback_slot_rate": 0.4765625,
+      "loss": 2.031750440597534,
+      "mean_confidence": 0.6398165337741375,
+      "route_kl": 1.2477385997772217,
+      "slot_hit_rate": 0.5234375,
+      "step": 100
+    }
+  ],
+  "verified_prefetch": {
+    "avg_lookahead_depth": 1.9443359375,
+    "batch": 8,
+    "cache_capacity": 64,
+    "compute_ms": 2.5,
+    "confidence_by_depth": {
+      "1": {
+        "count": 1024,
+        "mean": 0.5925398080435116
+      },
+      "2": {
+        "count": 896,
+        "mean": 0.6133739430058215
+      },
+      "3": {
+        "count": 63,
+        "mean": 0.6657949250841898
+      },
+      "4": {
+        "count": 7,
+        "mean": 0.6789218783378601
+      },
+      "5": {
+        "count": 1,
+        "mean": 0.605590283870697
+      }
+    },
+    "confidence_threshold": 0.7,
+    "depth_hist": {
+      "1": 128,
+      "2": 833,
+      "3": 56,
+      "4": 6,
+      "5": 1
+    },
+    "expert_mb": 64,
+    "fallback_slot_rate": 0.1429443359375,
+    "fallback_slots": 2342,
+    "issued_prefetches": 10700,
+    "l_max": 6,
+    "l_min": 2,
+    "pcie_gbps": 48.0,
+    "predicted_slot_attempts": 31856,
+    "prefetch_slot_hit_rate": 0.8570556640625,
+    "sim_stall_ms": 3049.4791666666665,
+    "sim_total_ms": 5670.919166666666,
+    "sim_tpot_ms": 44.304055989583325,
+    "steps": 128,
+    "total_slots": 16384,
+    "wrong_prefetch_rate": 0.5192114515318935,
+    "wrong_prefetches": 16540
+  }
+}

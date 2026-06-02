@@ -1,1 +1,64 @@
 # SPICE
+
+SPICE is a verified speculative expert-prefetching prototype for offloaded
+Mixture-of-Experts inference. The code in this repository reproduces two paths:
+
+1. Proxy system simulation for Naive, LRU, MoE-Offloading, Pre-gated MoE, and
+   SPICE-style speculative prefetching.
+2. Draft-model-driven SPICE with frozen target attention/router modules, LoRE
+   low-rank expert surrogates, routing-history context, route-KL training,
+   hidden-state alignment, adaptive prefetching, verified fallback, and optional
+   online self-correction.
+
+The default draft-model implementation uses a synthetic target MoE so that the
+full method can be validated without distributing model weights or datasets.
+The same code structure is intended to be replaced with target-model router and
+hidden-state traces when real MoE checkpoints are available.
+
+## Repository Layout
+
+- `experiments/draft_model.py`: target MoE, SPICE LoRE draft model, losses, and
+  routing metrics.
+- `experiments/train_draft_model.py`: offline draft-model training.
+- `experiments/eval_draft_prefetch.py`: draft-driven adaptive prefetching,
+  verified fallback, and online self-correction.
+- `experiments/prefetch_system_sim.py`: controlled prefetch system simulator.
+- `experiments/lossless_correctness.py`: verified-execution correctness check.
+- `experiments/timeline_replay.py`: CUDA H2D overlap replay.
+- `experiments/energy_per_token.py`: GPU energy replay.
+- `experiments/run_draft_suite.sh`: single-GPU draft training and evaluation.
+- `experiments/run_draft_parallel.sh`: two-GPU parallel draft training.
+
+## Quick Start
+
+```bash
+cd experiments
+python -m py_compile *.py
+python train_draft_model.py --gpu 0 --out_dir runs/draft_train --steps 800
+python eval_draft_prefetch.py \
+  --gpu 0 \
+  --out_dir runs/draft_eval \
+  --checkpoint runs/draft_train/spice_draft.pt \
+  --online_steps 100
+```
+
+For GPU workstation runs:
+
+```bash
+GPU=3 bash run_draft_suite.sh ~/workspace/spice/runs/manual_draft
+GPU_A=0 GPU_B=3 STEPS=2000 bash run_draft_parallel.sh ~/workspace/spice/runs/manual_parallel
+bash run_suite.sh ~/workspace/spice/runs/manual_system
+```
+
+## Correctness Invariant
+
+SPICE uses draft predictions only to schedule expert weight movement. The target
+router remains authoritative. If a target-selected expert is not resident, the
+runtime synchronously fetches it before expert execution. Therefore, prefetch
+misses affect latency and traffic, not target-model logits.
+
+## Notes
+
+Generated checkpoints, run logs, Nsight reports, and large result artifacts are
+ignored by git. Keep reproducible source code and compact summaries in the
+repository; store heavyweight artifacts outside the repo.
