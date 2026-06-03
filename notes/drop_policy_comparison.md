@@ -21,3 +21,13 @@ Matched: ~21% mass~=rank(16.0); ~33% rank 16.40 < mass ~16.69; ~50% rank 17.32 <
 => DeepSeek: rank >= gate > mass (mass WORST). Qwen: all within noise, rank marginally best.
 FINAL: no drop policy dominates cross-model; simple RANK is the most robust. top-p mass (entropy-adaptive) FALSIFIED. The miss-handling DROP-POLICY axis is SATURATED and INCREMENTAL (lever known to SpecMD/AdapMoE). This direction is CLOSED as a non-incremental contribution.
 Remaining non-incremental bets: (A) conservative contextual bandit adaptive scheduler (regret across hardware/workload shifts; risk=roofline-derivable), or (C) consolidate a strong systems paper (unified verified resource-constrained scheduler + validated Pareto + clean ablations). Decision pending codex strategic consult (notes/codex_run_strategic.log).
+
+## FIRST-PRINCIPLES routing structure (CROSS-MODEL, 2026-06-02)
+| measure | Qwen (60e,k4) | DeepSeek (64e,k6) |
+|---|---|---|
+| popularity Gini | 0.174 | 0.248 (both low, no hot-set) |
+| static hot-set hit @cache~50% experts | 0.65 | 0.67 (shallow) |
+| autocorr Jaccard lag1/lag8 | 0.13/0.056 | 0.19/0.093 (short memory) |
+| token-conditional consistency | 0.23 | 0.16 (NOT token-determined) |
+| working set / layer (8-tok window) | 37% | 43% (large) |
+UNIVERSAL: MoE decode expert access is near-uniform, short-memory, context-driven, large-working-set => cross-token caching/prediction has a fundamentally low ceiling; the only exploitable structure is within-token cross-layer (draft recall 0.7). This explains the entire field and bounds it. Strong characterization result.

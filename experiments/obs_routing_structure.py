@@ -22,7 +22,7 @@ def main():
     ap.add_argument("--top_k",type=int,default=4); ap.add_argument("--max_traces",type=int,default=60)
     args=ap.parse_args()
     man=json.loads((Path(args.trace_dir)/"manifest.json").read_text())
-    files=man["trace_files"][:args.max_traces]
+    files=man.get("trace_files",man.get("files",[]))[:args.max_traces]
     # gather per-layer topk lists per trace, + token ids
     L=0; E=0
     layer_freq=None; total_demands=0
@@ -33,12 +33,20 @@ def main():
     hotset_hits=None; hotset_total=0
     for f in files:
         d=torch.load(Path(args.trace_dir)/f,map_location="cpu",weights_only=False)
-        probs=d["router_probs"];
-        if not probs: continue
         ids=d.get("input_ids")
-        P=[(p.float().reshape(-1,p.shape[-1]) if p.ndim==3 else p.float()) for p in probs]
-        L=len(P); T=min(x.shape[0] for x in P); E=P[0].shape[-1]
-        TK=[torch.topk(P[l][:T],k=args.top_k,dim=-1).indices for l in range(L)]  # [T,k]
+        if "topk_idx" in d:   # ds_routing format: real expert IDs + scores
+            idxs=d["topk_idx"]; L=len(idxs)
+            if not L: continue
+            II=[(x.reshape(-1,x.shape[-1]) if x.ndim==3 else x) for x in idxs]
+            T=min(x.shape[0] for x in II)
+            sc=d.get("scores"); E=(sc[0].shape[-1] if sc else int(max(x.max() for x in II))+1)
+            TK=[II[l][:T,:args.top_k].long() for l in range(L)]
+        else:
+            probs=d["router_probs"]
+            if not probs: continue
+            P=[(p.float().reshape(-1,p.shape[-1]) if p.ndim==3 else p.float()) for p in probs]
+            L=len(P); T=min(x.shape[0] for x in P); E=P[0].shape[-1]
+            TK=[torch.topk(P[l][:T],k=args.top_k,dim=-1).indices for l in range(L)]
         if layer_freq is None: layer_freq=[torch.zeros(E) for _ in range(L)]
         for l in range(L):
             for t in range(T):
