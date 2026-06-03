@@ -1,0 +1,104 @@
+{
+  "down": {
+    "per_layer": [
+      {
+        "layer": 1,
+        "mean_energy_frac": 0.01563185267150402,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.484375
+      },
+      {
+        "layer": 7,
+        "mean_energy_frac": 0.01562411803752184,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.484375
+      },
+      {
+        "layer": 13,
+        "mean_energy_frac": 0.015622522681951523,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.46875
+      },
+      {
+        "layer": 19,
+        "mean_energy_frac": 0.01564447022974491,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.46875
+      }
+    ],
+    "mean_energy_frac_avg": 0.015630740905180573,
+    "rank90_over_N_avg": 0.890625
+  },
+  "gate": {
+    "per_layer": [
+      {
+        "layer": 1,
+        "mean_energy_frac": 0.020726937800645828,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.46875
+      },
+      {
+        "layer": 7,
+        "mean_energy_frac": 0.018446259200572968,
+        "N": 64,
+        "rank90_over_N": 0.875,
+        "rank50_over_N": 0.46875
+      },
+      {
+        "layer": 13,
+        "mean_energy_frac": 0.017486656084656715,
+        "N": 64,
+        "rank90_over_N": 0.875,
+        "rank50_over_N": 0.453125
+      },
+      {
+        "layer": 19,
+        "mean_energy_frac": 0.018541628494858742,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.46875
+      }
+    ],
+    "mean_energy_frac_avg": 0.018800370395183563,
+    "rank90_over_N_avg": 0.8828125
+  },
+  "up": {
+    "per_layer": [
+      {
+        "layer": 1,
+        "mean_energy_frac": 0.01563226245343685,
+        "N": 64,
+        "rank90_over_N": 0.875,
+        "rank50_over_N": 0.46875
+      },
+      {
+        "layer": 7,
+        "mean_energy_frac": 0.015609107911586761,
+        "N": 64,
+        "rank90_over_N": 0.875,
+        "rank50_over_N": 0.46875
+      },
+      {
+        "layer": 13,
+        "mean_energy_frac": 0.015633387491106987,
+        "N": 64,
+        "rank90_over_N": 0.875,
+        "rank50_over_N": 0.453125
+      },
+      {
+        "layer": 19,
+        "mean_energy_frac": 0.01564849726855755,
+        "N": 64,
+        "rank90_over_N": 0.890625,
+        "rank50_over_N": 0.46875
+      }
+    ],
+    "mean_energy_frac_avg": 0.015630813781172037,
+    "rank90_over_N_avg": 0.87890625
+  }
+}

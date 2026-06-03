@@ -1,0 +1,63 @@
+{
+  "experts": 64,
+  "top_k": 6,
+  "layers": 26,
+  "rows": [
+    {
+      "B": 1,
+      "unique_experts_per_layer": 6.0,
+      "byte_ratio_vs_single": 1.0,
+      "byte_reduction_x": 1.0,
+      "theory_byte_ratio": 1.0
+    },
+    {
+      "B": 2,
+      "unique_experts_per_layer": 11.2965,
+      "byte_ratio_vs_single": 0.941375,
+      "byte_reduction_x": 1.062275926171823,
+      "theory_byte_ratio": 0.953125
+    },
+    {
+      "B": 4,
+      "unique_experts_per_layer": 20.201,
+      "byte_ratio_vs_single": 0.8417083333333334,
+      "byte_reduction_x": 1.18805999702985,
+      "theory_byte_ratio": 0.8679580688476562
+    },
+    {
+      "B": 8,
+      "unique_experts_per_layer": 33.0925,
+      "byte_ratio_vs_single": 0.6894270833333334,
+      "byte_reduction_x": 1.4504797159477223,
+      "theory_byte_ratio": 0.7267047171080776
+    },
+    {
+      "B": 16,
+      "unique_experts_per_layer": 47.421,
+      "byte_ratio_vs_single": 0.49396875,
+      "byte_reduction_x": 2.0244195609540077,
+      "theory_byte_ratio": 0.5286673124079034
+    },
+    {
+      "B": 32,
+      "unique_experts_per_layer": 57.994,
+      "byte_ratio_vs_single": 0.30205208333333333,
+      "byte_reduction_x": 3.3106873124806016,
+      "theory_byte_ratio": 0.3190504670014566
+    },
+    {
+      "B": 64,
+      "unique_experts_per_layer": 62.536,
+      "byte_ratio_vs_single": 0.16285416666666666,
+      "byte_reduction_x": 6.140463093258283,
+      "theory_byte_ratio": 0.16636066626068527
+    },
+    {
+      "B": 128,
+      "unique_experts_per_layer": 63.7235,
+      "byte_ratio_vs_single": 0.08297330729166667,
+      "byte_reduction_x": 12.052068703068725,
+      "theory_byte_ratio": 0.08333305242458795
+    }
+  ]
+}
