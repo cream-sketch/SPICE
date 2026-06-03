@@ -42,7 +42,6 @@ def parse_args():
     ap.add_argument("--t_gate", type=float, required=True)
     ap.add_argument("--t_shared", type=float, required=True)
     ap.add_argument("--t_gpu", type=float, required=True)
-    ap.add_argument("--t_cpu1", type=float, required=True, help="CPU exact compute per single expert (ms)")
     ap.add_argument("--expert_mb", type=float, required=True)
     ap.add_argument("--act_kb", type=float, required=True, help="CPU activation roundtrip bytes (KB) over PCIe")
     return ap.parse_args()
@@ -67,126 +66,132 @@ def popularity(train, n_layers, n_experts):
     return pop
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, pop, horizon, shadow_slots, rng):
-    """Faithful timeline. Returns dict with total_ms, exposed components, REC usefulness counters."""
-    tok_ids = [v for (v, _) in seq]
-    t_fetch = comp["t_fetch"]; t_act = comp["t_act"]  # weight H2D, activation roundtrip (ms)
-    warmpop = sorted([((l, e), pop[l, e]) for l in range(n_layers) for e in range(n_experts)], key=lambda x: -x[1])
-    cache = set(k for k, _ in warmpop[:capacity])      # main resident cache (static warm; demand-fetch admits+LS)
-    last_used = {k: 0 for k in cache}; key_layer = {k: k[0] for k in cache}
-    shadow = {}                                         # key -> completion_time (REC prefetched, protected)
+PREFETCH_POLICIES = ("spice_rec", "oracle_shadow", "random_rec", "dummy_prefetch", "fetch_idle_prefetch")
+FETCH_POLICIES = ("fetch_fallback", "fetch_idle_prefetch")  # demand-fetch misses to GPU
 
-    clock = 0.0; copy_free = 0.0
-    total = 0.0
-    rec_bytes_issued = 0.0; rec_bytes_useful = 0.0; window_bytes_theory = 0.0
+
+def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, pop, horizon, shadow_slots, top_k, rng):
+    """Faithful timeline with a PREEMPTIBLE prefetch queue (codex fixes 1-8).
+    Copy engine: demand weight-fetch / activation copy-out are high priority (counted in layer time);
+    REC prefetch is interruptible and consumes ONLY genuine PCIe idle accumulated across layers, so it
+    NEVER delays demand (dummy_prefetch is correctly a timing no-op -> isolates prediction value, not
+    contention). idle is large for cpu policies (no weight fetch) and small for fetch policies -> this
+    isolates the bandwidth FREED by CPU-serving. shadow entries carry a within-token deadline."""
+    tok_ids = [v for (v, _) in seq]
+    t_fetch = comp["t_fetch"]; t_act = comp["t_act"]
+    warmpop = sorted([((l, e), pop[l, e]) for l in range(n_layers) for e in range(n_experts)], key=lambda x: -x[1])
+    cache = set(k for k, _ in warmpop[:capacity])
+    last_used = {k: 0 for k in cache}; key_layer = {k: k[0] for k in cache}
+    shadow = {}                       # key -> (target_tok, target_layer): completed prefetch, available
+    pf_queue = []                     # in-flight preemptible prefetch: [key, target_tok, target_layer, remaining_ms]
+
+    clock = 0.0; total = 0.0
+    rec_bytes_issued = 0.0; rec_bytes_useful = 0.0; idle_ms_total = 0.0
     exposed_fetch = 0.0; exposed_cpu = 0.0
 
-    def ls_evict():
-        victim = min(cache, key=lambda k: last_used[k])
+    def ls_dist(k, cur_layer):
+        d = (key_layer[k] - cur_layer) % n_layers
+        return n_layers if d == 0 else d
+
+    def ls_evict(cur_layer):
+        victim = max(cache, key=lambda k: (ls_dist(k, cur_layer), -last_used[k]))  # cyclic Least-Stale (codex #8)
         cache.discard(victim); last_used.pop(victim, None); key_layer.pop(victim, None)
+
+    def expired(target_tok, target_layer, ti, l):
+        return target_tok < ti or (target_tok == ti and target_layer < l)  # within-token deadline (codex #2)
 
     pos = 0
     for ti, (_v, pl) in enumerate(seq):
         for l in range(n_layers):
             layer_start = clock
-            # promote any shadow prefetches that have completed by now into availability
             routed = pl[l]
-            avail = []
-            misses = []
+            # drop expired shadow / in-flight prefetches (missed their within-token demand)
+            shadow = {k: v for k, v in shadow.items() if not expired(v[0], v[1], ti, l)}
+            pf_queue = [q for q in pf_queue if not expired(q[1], q[2], ti, l)]
+            avail = []; misses = []
             for e in routed:
                 k = (l, e)
                 if k in cache:
                     avail.append(e); last_used[k] = pos
-                elif k in shadow and shadow[k] <= clock:
-                    avail.append(e); rec_bytes_useful += comp["expert_mb"]  # on-time useful REC prefetch
-                    del shadow[k]
+                elif k in shadow:                       # prefetch completed on time
+                    avail.append(e); rec_bytes_useful += comp["expert_mb"]; del shadow[k]
                     cache.add(k); last_used[k] = pos; key_layer[k] = l
-                    if len(cache) > capacity: ls_evict()
+                    if len(cache) > capacity: ls_evict(l)
                 else:
                     misses.append(e)
-            # GPU base (attn+gate+shared+resident routed compute)
             gpu_base = comp["t_attn"] + comp["t_gate"] + comp["t_shared"] + len(avail) * comp["t_gpu"]
 
-            if policy == "fetch_fallback":
-                # each miss demand-fetched on copy engine (serial, predecessor of its gpu compute)
-                fetch_end = max(copy_free, layer_start)
-                for _e in misses:
-                    fetch_end += t_fetch
-                copy_free = fetch_end
-                # gpu compute of fetched experts after their fetch completes
+            if policy in FETCH_POLICIES:
+                demand_copy = len(misses) * t_fetch          # serial weight H2D (predecessor)
+                fetch_end = layer_start + demand_copy
                 gpu_done = max(layer_start + gpu_base, fetch_end) + len(misses) * comp["t_gpu"]
                 layer_end = gpu_done
                 exposed_fetch += max(0.0, fetch_end - (layer_start + gpu_base))
-                # admit fetched into cache (LS)
                 for e in misses:
-                    k = (l, e)
-                    cache.add(k); last_used[k] = pos; key_layer[k] = l
-                    if len(cache) > capacity: ls_evict()
+                    k = (l, e); cache.add(k); last_used[k] = pos; key_layer[k] = l
+                    if len(cache) > capacity: ls_evict(l)
             else:
-                # CPU serve all misses; activation roundtrip on copy engine (high priority, KB)
                 n_cpu = len(misses)
                 cpu_end = layer_start + cpu_burst(n_cpu)
-                act_end = max(copy_free, layer_start) + (t_act if n_cpu > 0 else 0.0)
-                copy_free = max(copy_free, act_end)
+                demand_copy = t_act if n_cpu > 0 else 0.0    # activation copy-out (KB, high priority)
                 gpu_done = layer_start + gpu_base
-                layer_end = max(gpu_done, cpu_end, act_end)
+                layer_end = max(gpu_done, cpu_end)
                 exposed_cpu += max(0.0, cpu_end - gpu_done)
-                # REC prefetch in the freed PCIe window [copy_free, layer_end] (low priority, idle-fill)
-                if policy in ("spice_rec", "oracle_shadow", "random_rec", "dummy_prefetch"):
-                    window = max(0.0, layer_end - copy_free)
-                    window_bytes_theory += comp["bw_mb_per_ms"] * window
-                    n_slots = int(window // t_fetch)  # whole experts prefetchable in the idle window
-                    if n_slots > 0:
-                        cand = pick_prefetch(policy, l, tok_ids[ti], routed_future(pl, l, horizon),
-                                             A, layer_marg, n_experts, cache, shadow, n_slots, rng, n_layers)
-                        t = copy_free
-                        for k in cand:
-                            t += t_fetch
-                            if policy != "dummy_prefetch":
-                                if len(shadow) < shadow_slots:
-                                    shadow[k] = t
-                            rec_bytes_issued += comp["expert_mb"]
-                        copy_free = t
-            total += (layer_end - layer_start)
-            clock = layer_end
-            pos += len(routed)
+
+            layer_dur = layer_end - layer_start
+            # genuine PCIe idle this layer = layer time minus high-priority demand copy
+            idle = max(0.0, layer_dur - demand_copy)
+            idle_ms_total += idle
+
+            if policy in PREFETCH_POLICIES:
+                # enqueue new candidates (bounded by shadow_slots + queue length)
+                room = shadow_slots - len(shadow) - len(pf_queue)
+                if room > 0:
+                    cand = pick_prefetch(policy, tok_ids[ti], pl, l, ti, A, layer_marg, n_experts,
+                                         cache, shadow, pf_queue, room, top_k, horizon, rng)
+                    for k, tt, tl in cand:
+                        pf_queue.append([k, tt, tl, t_fetch]); rec_bytes_issued += comp["expert_mb"]
+                # drain idle PCIe into queue head (preemptible; completes -> shadow)
+                budget = idle
+                while budget > 1e-9 and pf_queue:
+                    q = pf_queue[0]
+                    step = min(budget, q[3]); q[3] -= step; budget -= step
+                    if q[3] <= 1e-9:
+                        shadow[q[0]] = (q[1], q[2]); pf_queue.pop(0)
+            total += layer_dur; clock = layer_end; pos += len(routed)
     return {"total_ms": total, "tokens": len(seq), "exposed_fetch_ms": exposed_fetch,
             "exposed_cpu_ms": exposed_cpu, "rec_bytes_issued": rec_bytes_issued,
-            "rec_bytes_useful": rec_bytes_useful, "window_bytes_theory": window_bytes_theory}
+            "rec_bytes_useful": rec_bytes_useful, "idle_ms_total": idle_ms_total}
 
 
-def routed_future(pl, l, horizon):
-    """True experts at downstream layers l+1..l+horizon (for oracle); list of (layer, expert)."""
-    out = []
-    for j in range(l + 1, min(l + 1 + horizon, len(pl))):
-        for e in pl[j]:
-            out.append((j, e))
-    return out
-
-
-def pick_prefetch(policy, l, v_cur, true_future, A, layer_marg, n_experts, cache, shadow, n_slots, rng, n_layers):
-    """Choose up to n_slots downstream (layer,expert) to prefetch, not already resident/inflight."""
-    horizon_layers = sorted(set(j for (j, _e) in true_future))
-    cand = []
-    if policy == "oracle_shadow":
-        ranked = true_future  # true downstream experts
-    elif policy == "spice_rec":
-        # within-token draft proxy: top experts by A[j, v_cur, .] for each downstream layer
-        ranked = []
-        for j in horizon_layers:
-            probs = [(A.get((j, v_cur))[e] if A.get((j, v_cur)) is not None else layer_marg[j, e], (j, e))
-                     for e in range(n_experts)]
+def pick_prefetch(policy, v_cur, pl, l, ti, A, layer_marg, n_experts, cache, shadow, pf_queue, room, top_k, horizon, rng):
+    """Return up to `room` (key, target_tok, target_layer) downstream prefetch candidates for the CURRENT
+    token's layers l+1..l+horizon, not already resident/in-flight. dedup within candidates (codex #5)."""
+    inflight = set(q[0] for q in pf_queue)
+    layers = list(range(l + 1, min(l + 1 + horizon, len(pl))))
+    ranked = []
+    if policy in ("oracle_shadow",):
+        for j in layers:
+            for e in pl[j]:
+                ranked.append((j, e))
+    elif policy in ("spice_rec", "fetch_idle_prefetch"):
+        for j in layers:
+            row = A.get((j, v_cur))
+            probs = [((row[e] if row is not None else layer_marg[j, e]), e) for e in range(n_experts)]
             probs.sort(key=lambda x: -x[0])
-            ranked += [k for _p, k in probs[:4]]  # top-4 predicted per layer (~top_k)
+            for _p, e in probs[:top_k]:
+                ranked.append((j, e))
     elif policy in ("random_rec", "dummy_prefetch"):
-        ranked = [(j, int(rng.integers(0, n_experts))) for j in horizon_layers for _ in range(4)]
-    else:
-        ranked = []
-    for k in ranked:
-        if k in cache or k in shadow:
+        for j in layers:
+            for _ in range(top_k):
+                ranked.append((j, int(rng.integers(0, n_experts))))
+    cand = []; seen = set()
+    for (j, e) in ranked:
+        k = (j, e)
+        if k in cache or k in shadow or k in inflight or k in seen:
             continue
-        cand.append(k)
-        if len(cand) >= n_slots:
+        seen.add(k); cand.append((k, ti, j))   # target = current token, layer j (within-token deadline)
+        if len(cand) >= room:
             break
     return cand
 
@@ -211,7 +216,8 @@ def main():
     total_slots = n_layers * n_experts
     residencies = [float(x) for x in a.residency.split(",")]
     bws = [float(x) for x in a.bw_gbps.split(",")]
-    policies = ["fetch_fallback", "cpu_fiddler", "spice_rec", "oracle_shadow", "random_rec", "dummy_prefetch"]
+    policies = ["fetch_fallback", "fetch_idle_prefetch", "cpu_fiddler", "spice_rec",
+                "oracle_shadow", "random_rec", "dummy_prefetch"]
     rows = []
     for bw in bws:
         bw_mb_per_ms = bw * 1024.0 / 1000.0  # GB/s -> MB/ms
@@ -226,34 +232,38 @@ def main():
                 agg = defaultdict(float)
                 for s in test:
                     res = simulate(s, n_layers, n_experts, cap, pol, comp, A, layer_marg, pop,
-                                   a.prefetch_horizon, a.shadow_slots, rng)
+                                   a.prefetch_horizon, a.shadow_slots, a.top_k, rng)
                     for k, v in res.items(): agg[k] += v
                 tpot = agg["total_ms"] / max(1, agg["tokens"])
-                useful_frac = agg["rec_bytes_useful"] / max(1e-9, agg["window_bytes_theory"])
+                idle_bytes = agg["idle_ms_total"] * bw_mb_per_ms
+                useful_frac = agg["rec_bytes_useful"] / max(1e-9, idle_bytes)
                 rows.append({"bw": bw, "residency": r, "policy": pol, "tpot_ms": tpot,
-                             "exposed_fetch_ms_tok": agg["exposed_fetch_ms"] / max(1, agg["tokens"]),
                              "exposed_cpu_ms_tok": agg["exposed_cpu_ms"] / max(1, agg["tokens"]),
                              "rec_useful_mb_tok": agg["rec_bytes_useful"] / max(1, agg["tokens"]),
                              "rec_issued_mb_tok": agg["rec_bytes_issued"] / max(1, agg["tokens"]),
                              "useful_on_time_frac": useful_frac})
-                print(f"bw={bw:>4} res={r:>5} {pol:>15} TPOT={tpot:7.3f} exp_cpu={rows[-1]['exposed_cpu_ms_tok']:.3f} "
-                      f"rec_useful={rows[-1]['rec_useful_mb_tok']:6.1f}MB issued={rows[-1]['rec_issued_mb_tok']:6.1f} "
-                      f"useful_frac={useful_frac:.2f}", flush=True)
-    # verdict
+                print(f"bw={bw:>4} res={r:>5} {pol:>18} TPOT={tpot:7.3f} exp_cpu={rows[-1]['exposed_cpu_ms_tok']:6.3f} "
+                      f"rec_useful={rows[-1]['rec_useful_mb_tok']:6.1f} issued={rows[-1]['rec_issued_mb_tok']:6.1f} "
+                      f"uf={useful_frac:.2f}", flush=True)
+    # verdict: REC-specific gain = spice_rec vs fetch_idle_prefetch (same predictor, ONLY diff = CPU-serve
+    # frees bandwidth) AND vs cpu_fiddler (adds prefetch). random/dummy isolate prediction value.
     print("\n===== SPICE-REC VERDICT =====", flush=True)
     by = defaultdict(dict)
     for x in rows: by[(x["bw"], x["residency"])][x["policy"]] = x
     verdict = {}
     for (bw, r), d in by.items():
         fid = d["cpu_fiddler"]["tpot_ms"]; rec = d["spice_rec"]["tpot_ms"]; orc = d["oracle_shadow"]["tpot_ms"]
-        ff = d["fetch_fallback"]["tpot_ms"]; rnd = d["random_rec"]["tpot_ms"]
-        gain = (fid - rec) / fid if fid > 0 else 0.0
-        verdict[f"bw{bw}_r{r}"] = {"fetch_fallback": ff, "cpu_fiddler": fid, "spice_rec": rec,
-                                   "oracle_shadow": orc, "random_rec": rnd,
-                                   "rec_gain_over_fiddler_pct": 100 * gain,
-                                   "GO": gain >= 0.15 and rec < rnd}
-        print(f"bw{bw} r{r}: fetch={ff:.2f} fiddler={fid:.2f} spice_rec={rec:.2f} oracle={orc:.2f} "
-              f"random={rnd:.2f} | REC_gain_vs_fiddler={100*gain:+.1f}% {'GO' if (gain>=0.15 and rec<rnd) else 'no'}", flush=True)
+        ff = d["fetch_fallback"]["tpot_ms"]; fip = d["fetch_idle_prefetch"]["tpot_ms"]
+        rnd = d["random_rec"]["tpot_ms"]; dum = d["dummy_prefetch"]["tpot_ms"]
+        g_fid = (fid - rec) / fid if fid > 0 else 0.0          # adding prefetch to cpu-serve
+        g_fip = (fip - rec) / fip if fip > 0 else 0.0          # REC-specific: CPU-serve freed bandwidth
+        verdict[f"bw{bw}_r{r}"] = {"fetch_fallback": ff, "fetch_idle_prefetch": fip, "cpu_fiddler": fid,
+                                   "spice_rec": rec, "oracle_shadow": orc, "random_rec": rnd, "dummy": dum,
+                                   "gain_vs_fiddler_pct": 100 * g_fid, "gain_vs_fetch_idle_pct": 100 * g_fip,
+                                   "GO": g_fid >= 0.15 and rec < rnd}
+        print(f"bw{bw} r{r}: ff={ff:.2f} fetch+pf={fip:.2f} fiddler={fid:.2f} spice_rec={rec:.2f} "
+              f"oracle={orc:.2f} rand={rnd:.2f} dummy={dum:.2f} | vs_fiddler={100*g_fid:+.1f}% "
+              f"vs_fetch+pf={100*g_fip:+.1f}% rec<rand={rec<rnd}", flush=True)
     Path(a.out).write_text(json.dumps({"rows": rows, "verdict": verdict}, indent=2))
 
 
