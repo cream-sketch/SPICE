@@ -1,0 +1,14 @@
+{
+  "n": 32544,
+  "routed_pert_to_hidden_mean": 0.09824318053131213,
+  "shared_to_routed_mean": 1.3773625649448817,
+  "contribution_gini_mean": 0.329854761305153,
+  "gate_top==contrib_top": 1.0,
+  "gate_bot==contrib_bot": 0.9613139134709932,
+  "mean_contrib_by_rank": [
+    4.440083851622035,
+    1.9916190172718689,
+    1.0592608719097125,
+    0.6263368103942571
+  ]
+}
