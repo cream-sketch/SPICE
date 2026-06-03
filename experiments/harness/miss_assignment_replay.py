@@ -196,7 +196,7 @@ def select_fetch(policy: str, misses: list[int], l: int, tid: int, ti: int, pop,
 
     if policy == "capacity_spice":
         row = future_tbl.get((l, tid))
-        ranked = sorted(misses, key=lambda e: -((row[e] if row is not None else future_marg[l][e]), pop[l][e]))
+        ranked = sorted(misses, key=lambda e: (-(row[e] if row is not None else future_marg[l][e]), -pop[l][e]))
         return ranked[:n_fetch]
 
     if policy == "oracle_admit":
