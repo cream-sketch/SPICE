@@ -26,6 +26,7 @@ def parse_args():
     ap.add_argument("--top_k", type=int, required=True)
     ap.add_argument("--alpha", type=float, required=True, help="Laplace smoothing for A[j,v,e] toward layer marginal")
     ap.add_argument("--rho", type=float, required=True, help="discount on cross-token (next token) term")
+    ap.add_argument("--w_rec", type=float, required=True, help="weight of recency (cyclic-proximity) survival term; recovers LS at larger cache")
     ap.add_argument("--train_frac", type=float, required=True)
     ap.add_argument("--residency", type=str, required=True, help="comma list of cache residency fractions of (layers*experts)")
     ap.add_argument("--max_test_tokens", type=int, required=True)
@@ -101,7 +102,7 @@ def a_lookup(tbl, layer_marg, l, tid, e):
     return float(v[e]) if v is not None else float(layer_marg[l, e])
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho):
+def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho, w_rec):
     """Replay one sequence's (layer,expert) stream under a policy. Return (hits, misses).
     Stream order = token by token, layer 0..L-1, experts within a layer. token context available."""
     # flatten with token index + per-position token ids
@@ -133,14 +134,16 @@ def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho):
         return n_layers if d == 0 else d
 
     def value(k, cur_layer, cur_tok):
-        """REALIZABLE survival next-use prob (codex leakage fix): within-token uses current token id
-        (known) for its future layers j>cur_layer; cross-token uses transition table B[j,v_cur,e]
-        (P next token uses (j,e) | current token) -- does NOT peek at v_{t+1}. Higher = keep."""
+        """REALIZABLE survival next-use prob fusing THREE events (all realizable at eviction time):
+        within-token A[j,v_cur,e] (j>cur_layer), cross-token transition B[j,v_cur,e], and a RECENCY
+        term = cyclic proximity (recovers LS's cross-layer keep so value >= LS at larger cache,
+        fixing the 20% regression). Higher = keep. Evict argmin."""
         j, e = k
         v_cur = tok_ids[cur_tok]
         within = a_lookup(A, layer_marg, j, v_cur, e) if j > cur_layer else 0.0
-        cross = rho * a_lookup(B, layer_marg, j, v_cur, e)  # transition, realizable for all j
-        return 1.0 - (1.0 - within) * (1.0 - min(cross, 1.0))
+        cross = rho * a_lookup(B, layer_marg, j, v_cur, e)
+        recency = w_rec * (1.0 - (ls_dist(k, cur_layer) - 1) / n_layers)  # 1 at next layer -> 0 at full cycle
+        return 1.0 - (1.0 - within) * (1.0 - min(cross, 1.0)) * (1.0 - min(recency, 1.0))
 
     def evict(cur_layer, pos, cur_tok):
         if policy == "lru":
@@ -197,7 +200,7 @@ def main():
             rho_use = 0.0 if pol == "value_within" else a.rho
             pol_run = "value" if pol == "value_within" else pol
             for s in test:
-                hi, mi = simulate(s, n_layers, n_experts, cap, pol_run, A, B, layer_marg, rho_use)
+                hi, mi = simulate(s, n_layers, n_experts, cap, pol_run, A, B, layer_marg, rho_use, a.w_rec)
                 h += hi; m += mi
             hr = h / max(1, h + m)
             rows.append({"residency": r, "capacity": cap, "policy": pol, "hit_rate": hr,
@@ -212,8 +215,8 @@ def main():
         cap = max(1, int(round(r * total)))
         per_seq = []  # (value_hits, value_slots, ls_hits, ls_slots) per sequence
         for s in test:
-            vh, vm = simulate(s, n_layers, n_experts, cap, "value", A, B, layer_marg, a.rho)
-            lh, lm = simulate(s, n_layers, n_experts, cap, "specmd_ls", A, B, layer_marg, a.rho)
+            vh, vm = simulate(s, n_layers, n_experts, cap, "value", A, B, layer_marg, a.rho, a.w_rec)
+            lh, lm = simulate(s, n_layers, n_experts, cap, "specmd_ls", A, B, layer_marg, a.rho, a.w_rec)
             per_seq.append((vh, vh + vm, lh, lh + lm))
         arr = np.array(per_seq, dtype=float)
         n = len(arr)
