@@ -37,7 +37,7 @@ def parse_args():
     ap.add_argument("--train_frac", type=float, required=True)
     ap.add_argument("--residency", type=str, required=True)
     ap.add_argument("--max_test_tokens", type=int, required=True)
-    ap.add_argument("--r_star", type=int, required=True, help="oracle: admit iff true future reuse count >= r_star")
+    ap.add_argument("--r_star", type=str, required=True, help="oracle: comma list of future-reuse thresholds to sweep (admit iff future reuse >= r)")
     ap.add_argument("--token_thresh", type=str, required=True, help="comma list of token-value admission thresholds to sweep")
     # measured components (real A800, ms)
     ap.add_argument("--t_attn", type=float, required=True)
@@ -70,7 +70,7 @@ def popularity(train, n_layers, n_experts):
     return pop
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, B, layer_marg, rho, r_star, tok_th, pop):
+def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, B, layer_marg, rho, param, pop):
     """Replay one sequence; return dict of accumulated TPOT-ms, fetched_count, cpu_served_count,
     hits, admit-vs-oracle agreement counts."""
     tok_ids = [v for (v, _) in seq]
@@ -129,9 +129,9 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, B, layer_marg,
                 elif policy == "cpu_always":
                     admit = False  # never dynamically admit (static resident only)
                 elif policy == "oracle_admit":
-                    admit = future_reuse(key, pos + routed.index(e)) >= r_star
+                    admit = future_reuse(key, pos + routed.index(e)) >= param
                 elif policy == "token_admit":
-                    admit = token_value(key, l, ti) >= tok_th
+                    admit = token_value(key, l, ti) >= param
                 else:
                     raise ValueError(policy)
                 if admit:
@@ -179,19 +179,21 @@ def main():
     expert_bytes = a.expert_mb
     residencies = [float(x) for x in a.residency.split(",")]
     token_threshs = [float(x) for x in a.token_thresh.split(",")]
+    r_stars = [int(x) for x in a.r_star.split(",")]
     rows = []
     for r in residencies:
         cap = max(1, int(round(r * total)))
-        runs = [("fetch_all", None), ("cpu_always", None), ("oracle_admit", None)]
+        runs = [("fetch_all", 0.0), ("cpu_always", 0.0)]
+        runs += [("oracle_admit", float(r)) for r in r_stars]
         runs += [("token_admit", th) for th in token_threshs]
-        for pol, th in runs:
+        for pol, param in runs:
             agg = defaultdict(float)
             for s in test:
-                res = simulate(s, n_layers, n_experts, cap, pol, comp, A, B, layer_marg, a.rho, a.r_star, th or 0.0, pop)
+                res = simulate(s, n_layers, n_experts, cap, pol, comp, A, B, layer_marg, a.rho, param, pop)
                 for k, v in res.items(): agg[k] += v
             tpot = agg["tpot_ms"] / max(1, agg["tokens"])
             bytes_per_tok = agg["n_fetch"] * expert_bytes / max(1, agg["tokens"])
-            label = f"{pol}" + (f"@{th}" if th is not None else "")
+            label = f"{pol}" + (f"@{param:g}" if pol in ("oracle_admit", "token_admit") else "")
             rows.append({"residency": r, "cap": cap, "policy": label, "tpot_ms": tpot,
                          "h2d_mb_per_tok": bytes_per_tok, "n_fetch": agg["n_fetch"],
                          "n_cpu": agg["n_cpu"], "hits": agg["hits"]})
@@ -203,7 +205,8 @@ def main():
     for x in rows: by[x["residency"]][x["policy"]] = x
     verdict = {}
     for r, d in by.items():
-        fa = d["fetch_all"]; ca = d["cpu_always"]; orc = d["oracle_admit"]
+        fa = d["fetch_all"]; ca = d["cpu_always"]
+        orc = min([v for k, v in d.items() if k.startswith("oracle_admit")], key=lambda x: x["tpot_ms"])
         toks = [v for k, v in d.items() if k.startswith("token_admit")]
         # best_token = min TPOT; matched_token = token run whose H2D bytes closest to oracle's (fair budget)
         best_tok = min(toks, key=lambda x: x["tpot_ms"])
