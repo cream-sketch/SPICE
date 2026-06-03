@@ -1,0 +1,27 @@
+{
+  "_note": "Real resource-edge microbenchmark on A800 80GB PCIe, batch=1, Qwen expert shape (2048/1408), bf16, exact same-precision. 104 CPU cores. From experiments/spice_resource_microbench.py.",
+  "d_model": 2048,
+  "d_inter": 1408,
+  "expert_mb": 17.301504,
+  "t_gpu_expert_ms": 0.05780992031097412,
+  "t_h2d_weight_ms": 0.781937255859375,
+  "pcie_h2d_gbps": 21.607871825253724,
+  "t_cpu_expert_ms": 0.1674095299676992,
+  "t_d2h_act_ms": 0.018932160139083862,
+  "dram_contention": {
+    "cpu_alone_ms": 0.15353713490185328,
+    "cpu_during_dma_ms": 0.16132399498019367,
+    "slowdown_x": 1.050716460765782
+  },
+  "pcie_priority": {
+    "small_h2d_alone_ms": 0.009056000038981438,
+    "small_h2d_behind_big_lowpri_ms": 0.006432000081986189,
+    "preempted": true
+  },
+  "copy_engines": {
+    "h2d_only_ms": 0.7813651275634765,
+    "d2h_only_ms": 0.7777503967285156,
+    "both_ms": 1.2179030609130859,
+    "overlap": true
+  }
+}
