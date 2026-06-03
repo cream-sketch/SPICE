@@ -18,6 +18,9 @@ Policies:
 Key metric (codex): useful_on_time_REC_bytes / theoretical_window_bytes. GO: spice_rec beats
 cpu_fiddler by >=15-20% exposed stall AND meaningful wall-clock. All printed English. No core defaults.
 """
+import sys, pathlib  # bootstrap: resolve sibling explore module (spice_x_eviction_value) regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
 import argparse, json, glob
 from pathlib import Path
 from collections import defaultdict

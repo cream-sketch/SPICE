@@ -35,6 +35,9 @@ Eviction policies / 驱逐策略:
 
 from __future__ import annotations
 
+import sys, pathlib  # bootstrap: resolve core/common (lives in ../core) regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "core"))
+
 import argparse
 import json
 import sys

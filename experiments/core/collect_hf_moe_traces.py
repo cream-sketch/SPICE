@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys, pathlib  # bootstrap: resolve sibling core modules regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
 import argparse
 import re
 from pathlib import Path

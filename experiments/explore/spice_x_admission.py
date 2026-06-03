@@ -20,6 +20,9 @@ NOTE: this is a single-stream PROXY (no real overlap of copy/CPU/GPU beyond the 
 applied to ALL policies so the RELATIVE ranking (token vs oracle vs cpu_always vs fetch_all) is the
 verdict. Absolute TPOT is approximate. All printed content English. Core params: no defaults.
 """
+import sys, pathlib  # bootstrap: resolve sibling explore module (spice_x_eviction_value) regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
 import argparse, json
 from pathlib import Path
 from collections import defaultdict

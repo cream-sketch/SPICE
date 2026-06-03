@@ -14,6 +14,10 @@ Metrics per horizon d:
   also report ||z_draft - z_true||/||z_true|| (input drift) for diagnosis.
 GO if value_accept@1e-2 >= ~0.5 at some d>=2. All printed English. Core params: no defaults.
 """
+import sys, pathlib  # bootstrap: resolve local + harness siblings regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "harness"))
+
 import argparse, json, types
 from pathlib import Path
 from collections import defaultdict

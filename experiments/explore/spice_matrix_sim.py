@@ -13,6 +13,9 @@ Policies (all EXACT):
                   CPU-serve(0.167) + admit the expert's 3 matrices.
   oracle_matrix : matrix objects with Belady eviction (true next use). Upper bound.
 """
+import sys, pathlib  # bootstrap: resolve sibling explore module (spice_x_eviction_value) regardless of CWD
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
 import argparse, json
 from pathlib import Path
 from collections import defaultdict
