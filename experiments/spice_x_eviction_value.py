@@ -102,7 +102,7 @@ def a_lookup(tbl, layer_marg, l, tid, e):
     return float(v[e]) if v is not None else float(layer_marg[l, e])
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho, w_rec):
+def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho, w_rec, within_mode):
     """Replay one sequence's (layer,expert) stream under a policy. Return (hits, misses).
     Stream order = token by token, layer 0..L-1, experts within a layer. token context available."""
     # flatten with token index + per-position token ids
@@ -133,16 +133,23 @@ def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho, 
         d = (key_layer[k] - cur_layer) % n_layers
         return n_layers if d == 0 else d
 
+    true_routing = [set().union(*[set(t) for t in pl]) if pl else set() for (_v, pl) in seq]
+    true_by_layer = [[set(t) for t in pl] for (_v, pl) in seq]  # true_by_layer[tok][layer] = set of experts
+
     def value(k, cur_layer, cur_tok):
-        """REALIZABLE survival next-use prob fusing THREE events (all realizable at eviction time):
-        within-token A[j,v_cur,e] (j>cur_layer), cross-token transition B[j,v_cur,e], and a RECENCY
-        term = cyclic proximity (recovers LS's cross-layer keep so value >= LS at larger cache,
-        fixing the 20% regression). Higher = keep. Evict argmin."""
+        """REALIZABLE survival next-use prob: within-token + cross-token transition B + recency.
+        within_mode 'table' -> A[j,v_cur,e] (realizable floor, token-id predictor);
+        within_mode 'oracle' -> 1 if e truly used at layer j>cur_layer of current token (CEILING:
+        upper bound on what a perfect within-token draft like SPICE could give)."""
         j, e = k
         v_cur = tok_ids[cur_tok]
-        within = a_lookup(A, layer_marg, j, v_cur, e) if j > cur_layer else 0.0
+        if j > cur_layer:
+            within = (1.0 if e in true_by_layer[cur_tok][j] else 0.0) if within_mode == "oracle" \
+                     else a_lookup(A, layer_marg, j, v_cur, e)
+        else:
+            within = 0.0
         cross = rho * a_lookup(B, layer_marg, j, v_cur, e)
-        recency = w_rec * (1.0 - (ls_dist(k, cur_layer) - 1) / n_layers)  # 1 at next layer -> 0 at full cycle
+        recency = w_rec * (1.0 - (ls_dist(k, cur_layer) - 1) / n_layers)
         return 1.0 - (1.0 - within) * (1.0 - min(cross, 1.0)) * (1.0 - min(recency, 1.0))
 
     def evict(cur_layer, pos, cur_tok):
@@ -190,17 +197,19 @@ def main():
 
     total = n_layers * n_experts
     residencies = [float(x) for x in a.residency.split(",")]
-    policies = ["lru", "specmd_ls", "value_within", "value", "oracle_belady"]
+    policies = ["lru", "specmd_ls", "value_within", "value", "value_oracle_within", "oracle_belady"]
     rows = []
     for r in residencies:
         cap = max(1, int(round(r * total)))
         for pol in policies:
             h = m = 0
             # value_within = within-token only (rho=0): isolates within-token A contribution
-            rho_use = 0.0 if pol == "value_within" else a.rho
-            pol_run = "value" if pol == "value_within" else pol
+            rho_use = 0.0 if pol in ("value_within", "value_oracle_within") else a.rho
+            wrec_use = 0.0 if pol in ("value_within", "value_oracle_within") else a.w_rec
+            wmode = "oracle" if pol == "value_oracle_within" else "table"
+            pol_run = "value" if pol in ("value_within", "value_oracle_within") else pol
             for s in test:
-                hi, mi = simulate(s, n_layers, n_experts, cap, pol_run, A, B, layer_marg, rho_use, a.w_rec)
+                hi, mi = simulate(s, n_layers, n_experts, cap, pol_run, A, B, layer_marg, rho_use, wrec_use, wmode)
                 h += hi; m += mi
             hr = h / max(1, h + m)
             rows.append({"residency": r, "capacity": cap, "policy": pol, "hit_rate": hr,
@@ -215,8 +224,8 @@ def main():
         cap = max(1, int(round(r * total)))
         per_seq = []  # (value_hits, value_slots, ls_hits, ls_slots) per sequence
         for s in test:
-            vh, vm = simulate(s, n_layers, n_experts, cap, "value", A, B, layer_marg, a.rho, a.w_rec)
-            lh, lm = simulate(s, n_layers, n_experts, cap, "specmd_ls", A, B, layer_marg, a.rho, a.w_rec)
+            vh, vm = simulate(s, n_layers, n_experts, cap, "value", A, B, layer_marg, a.rho, a.w_rec, "table")
+            lh, lm = simulate(s, n_layers, n_experts, cap, "specmd_ls", A, B, layer_marg, a.rho, a.w_rec, "table")
             per_seq.append((vh, vh + vm, lh, lh + lm))
         arr = np.array(per_seq, dtype=float)
         n = len(arr)
