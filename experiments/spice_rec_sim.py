@@ -44,6 +44,8 @@ def parse_args():
     ap.add_argument("--t_gpu", type=float, required=True)
     ap.add_argument("--expert_mb", type=float, required=True)
     ap.add_argument("--act_kb", type=float, required=True, help="CPU activation roundtrip bytes (KB) over PCIe")
+    ap.add_argument("--compress_ratio", type=float, required=True, help="compressed_fetch: expert H2D bytes fraction (e.g. 0.25 int4)")
+    ap.add_argument("--drop_ratio", type=float, required=True, help="slo_drop: fraction of routed experts to drop (lowest gate rank)")
     return ap.parse_args()
 
 
@@ -67,7 +69,7 @@ def popularity(train, n_layers, n_experts):
 
 
 PREFETCH_POLICIES = ("spice_rec", "oracle_shadow", "random_rec", "dummy_prefetch", "fetch_idle_prefetch")
-FETCH_POLICIES = ("fetch_fallback", "fetch_idle_prefetch")  # demand-fetch misses to GPU
+FETCH_POLICIES = ("fetch_fallback", "fetch_idle_prefetch", "compressed_fetch")  # demand-fetch misses to GPU
 
 
 def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, pop, horizon, shadow_slots, top_k, rng):
@@ -122,7 +124,8 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, po
             gpu_base = comp["t_attn"] + comp["t_gate"] + comp["t_shared"] + len(avail) * comp["t_gpu"]
 
             if policy in FETCH_POLICIES:
-                demand_copy = len(misses) * t_fetch          # serial weight H2D (predecessor)
+                tf = t_fetch * (comp["compress_ratio"] if policy == "compressed_fetch" else 1.0)  # low-bit shortens H2D
+                demand_copy = len(misses) * tf
                 fetch_end = layer_start + demand_copy
                 gpu_done = max(layer_start + gpu_base, fetch_end) + len(misses) * comp["t_gpu"]
                 layer_end = gpu_done
@@ -131,12 +134,23 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, po
                     k = (l, e); cache.add(k); last_used[k] = pos; key_layer[k] = l
                     if len(cache) > capacity: ls_evict(l)
             else:
-                n_cpu = len(misses)
-                cpu_end = layer_start + cpu_burst(n_cpu)
-                demand_copy = t_act if n_cpu > 0 else 0.0    # activation copy-out (KB, high priority)
-                gpu_done = layer_start + gpu_base
-                layer_end = max(gpu_done, cpu_end)
-                exposed_cpu += max(0.0, cpu_end - gpu_done)
+                served = misses
+                if policy == "slo_drop":            # break exact dependency: drop lowest-rank missed experts
+                    keep = max(0, len(misses) - int(round(comp["drop_ratio"] * len(routed))))
+                    served = misses[:keep]          # misses keep routed (gate-rank) order; drop tail
+                n_cpu = len(served)
+                if n_cpu > 0:
+                    # FAITHFUL CPU path (codex/user): D2H(h) -> CPU compute -> H2D(out) -> merge, SERIAL
+                    t_act_in = t_act; t_act_out = n_cpu * t_act
+                    cpu_start = layer_start + t_act_in
+                    cpu_done = cpu_start + cpu_burst(n_cpu)
+                    out_done = cpu_done + t_act_out
+                    demand_copy = t_act_in + t_act_out
+                    layer_end = max(layer_start + gpu_base, out_done)
+                    exposed_cpu += max(0.0, out_done - (layer_start + gpu_base))
+                else:
+                    demand_copy = 0.0
+                    layer_end = layer_start + gpu_base
 
             layer_dur = layer_end - layer_start
             # genuine PCIe idle this layer = layer time minus high-priority demand copy
@@ -218,15 +232,16 @@ def main():
     total_slots = n_layers * n_experts
     residencies = [float(x) for x in a.residency.split(",")]
     bws = [float(x) for x in a.bw_gbps.split(",")]
-    policies = ["fetch_fallback", "fetch_idle_prefetch", "cpu_fiddler", "spice_rec",
-                "oracle_shadow", "random_rec", "dummy_prefetch"]
+    policies = ["fetch_fallback", "fetch_idle_prefetch", "compressed_fetch", "cpu_fiddler",
+                "spice_rec", "oracle_shadow", "random_rec", "dummy_prefetch", "slo_drop"]
     rows = []
     for bw in bws:
         bw_mb_per_ms = bw * 1024.0 / 1000.0  # GB/s -> MB/ms
         t_fetch = a.expert_mb / bw_mb_per_ms
         t_act = (a.act_kb / 1024.0) / bw_mb_per_ms
         comp = {"t_attn": a.t_attn, "t_gate": a.t_gate, "t_shared": a.t_shared, "t_gpu": a.t_gpu,
-                "t_fetch": t_fetch, "t_act": t_act, "expert_mb": a.expert_mb, "bw_mb_per_ms": bw_mb_per_ms}
+                "t_fetch": t_fetch, "t_act": t_act, "expert_mb": a.expert_mb, "bw_mb_per_ms": bw_mb_per_ms,
+                "compress_ratio": a.compress_ratio, "drop_ratio": a.drop_ratio}
         for r in residencies:
             cap = max(1, int(round(r * total_slots)))
             for pol in policies:
