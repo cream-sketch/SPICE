@@ -1,0 +1,20 @@
+{
+  "experiment": "spec_decode_capture_real_trajectory",
+  "target_dir": "/data/Models/Qwen1.5-MoE-A2.7",
+  "draft_dir": "/data/Models/Qwen1.5-0.5B-Chat",
+  "K": 4,
+  "n_layers": 24,
+  "n_experts": 60,
+  "top_k": 4,
+  "num_prompts": 40,
+  "num_verify_steps": 1511,
+  "accept_rate_by_position": [
+    0.6479152878888154,
+    0.6547497446373851,
+    0.7067082683307332,
+    0.7483443708609272
+  ],
+  "mean_accept_count": 1.5962938451356716,
+  "mean_tokens_per_step": 2.596293845135672,
+  "mean_reuse_C_over_U": 1.2683708005845642
+}

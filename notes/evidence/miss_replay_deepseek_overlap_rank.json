@@ -1,0 +1,156 @@
+{
+  "args": {
+    "trace_dir": "/home/ziheng/workspace/spice_runs/ds_decode_big",
+    "cost_json": "/tmp/miss_assign_deepseek_bf16_t16.json",
+    "out": "/tmp/miss_replay_deepseek_overlap_rank.json",
+    "train_frac": 0.4,
+    "residency": "0.05,0.10,0.20",
+    "max_test_tokens": 6000,
+    "t_attn": 0.48,
+    "t_gate": 0.067,
+    "t_shared": 0.14,
+    "t_gpu": 0.079,
+    "layer_mode": "overlap",
+    "admit_value": "rank"
+  },
+  "trace": {
+    "n_layers": 26,
+    "n_experts": 64,
+    "top_k": 6
+  },
+  "cost_meta": {
+    "gpu": 0,
+    "d_model": 2048,
+    "d_inter": 1408,
+    "top_k": 6,
+    "iters": 50,
+    "warmup": 20,
+    "cpu_threads": 16,
+    "cpu_dtype": "bf16",
+    "bank": 48,
+    "seed": 16,
+    "out": "/tmp/miss_assign_deepseek_bf16_t16.json"
+  },
+  "rows": [
+    {
+      "residency": 0.05,
+      "capacity": 83,
+      "policy": "fetch_all",
+      "tpot_ms": 125.86727981558579,
+      "hit_rate": 0.1642614335818526,
+      "misses_per_tok": 130.375216361231,
+      "fetches_per_tok": 130.375216361231,
+      "cpu_served_per_tok": 0.0
+    },
+    {
+      "residency": 0.05,
+      "capacity": 83,
+      "policy": "cpu_all",
+      "tpot_ms": 68.66142361352281,
+      "hit_rate": 0.06421594149839722,
+      "misses_per_tok": 145.98231312625003,
+      "fetches_per_tok": 0.0,
+      "cpu_served_per_tok": 145.98231312625003
+    },
+    {
+      "residency": 0.05,
+      "capacity": 83,
+      "policy": "hybrid_noadmit",
+      "tpot_ms": 64.46557528923505,
+      "hit_rate": 0.06421594149839722,
+      "misses_per_tok": 145.98231312625003,
+      "fetches_per_tok": 50.36603988550686,
+      "cpu_served_per_tok": 95.61627324074318
+    },
+    {
+      "residency": 0.05,
+      "capacity": 83,
+      "policy": "hybrid_admit",
+      "tpot_ms": 60.83108083498818,
+      "hit_rate": 0.15402407766388868,
+      "misses_per_tok": 131.97224388443334,
+      "fetches_per_tok": 44.95097989763436,
+      "cpu_served_per_tok": 87.02126398679899
+    },
+    {
+      "residency": 0.1,
+      "capacity": 166,
+      "policy": "fetch_all",
+      "tpot_ms": 108.68165154361724,
+      "hit_rate": 0.2986035194008774,
+      "misses_per_tok": 109.41785097346312,
+      "fetches_per_tok": 109.41785097346312,
+      "cpu_served_per_tok": 0.0
+    },
+    {
+      "residency": 0.1,
+      "capacity": 166,
+      "policy": "cpu_all",
+      "tpot_ms": 66.61515437255902,
+      "hit_rate": 0.12510558232856953,
+      "misses_per_tok": 136.48352915674317,
+      "fetches_per_tok": 0.0,
+      "cpu_served_per_tok": 136.48352915674317
+    },
+    {
+      "residency": 0.1,
+      "capacity": 166,
+      "policy": "hybrid_noadmit",
+      "tpot_ms": 62.26186523386199,
+      "hit_rate": 0.12510558232856953,
+      "misses_per_tok": 136.48352915674317,
+      "fetches_per_tok": 47.30427643449499,
+      "cpu_served_per_tok": 89.17925272224817
+    },
+    {
+      "residency": 0.1,
+      "capacity": 166,
+      "policy": "hybrid_admit",
+      "tpot_ms": 57.132359733235276,
+      "hit_rate": 0.23742137925518672,
+      "misses_per_tok": 118.96226483619087,
+      "fetches_per_tok": 39.38464937194071,
+      "cpu_served_per_tok": 79.57761546425014
+    },
+    {
+      "residency": 0.2,
+      "capacity": 333,
+      "policy": "fetch_all",
+      "tpot_ms": 90.98806564843835,
+      "hit_rate": 0.43875685238947476,
+      "misses_per_tok": 87.55393102724194,
+      "fetches_per_tok": 87.55393102724194,
+      "cpu_served_per_tok": 0.0
+    },
+    {
+      "residency": 0.2,
+      "capacity": 333,
+      "policy": "cpu_all",
+      "tpot_ms": 61.44923642735441,
+      "hit_rate": 0.2403760815896625,
+      "misses_per_tok": 118.5013312720126,
+      "fetches_per_tok": 0.0,
+      "cpu_served_per_tok": 118.5013312720126
+    },
+    {
+      "residency": 0.2,
+      "capacity": 333,
+      "policy": "hybrid_noadmit",
+      "tpot_ms": 57.13242073464734,
+      "hit_rate": 0.2403760815896625,
+      "misses_per_tok": 118.5013312720126,
+      "fetches_per_tok": 39.503011105829536,
+      "cpu_served_per_tok": 78.99832016618309
+    },
+    {
+      "residency": 0.2,
+      "capacity": 333,
+      "policy": "hybrid_admit",
+      "tpot_ms": 51.207581970645,
+      "hit_rate": 0.36174233793060623,
+      "misses_per_tok": 99.56819528282541,
+      "fetches_per_tok": 30.26105239268906,
+      "cpu_served_per_tok": 69.30714289013636
+    }
+  ]
+}
