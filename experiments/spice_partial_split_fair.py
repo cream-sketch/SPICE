@@ -103,9 +103,11 @@ def build_expert(d_model, d_inter, dev, cpu_dt):
     gpu_dt = torch.bfloat16
     # Master values in fp32 on host, then derive all copies so split == full numerically.
     # 主值在 host fp32 上生成, 由它派生所有副本, 保证切分与整专家数值一致.
-    Wg32 = torch.randn(d_inter, d_model)
-    Wu32 = torch.randn(d_inter, d_model)
-    Wd32 = torch.randn(d_model, d_inter)
+    # Scale by 1/sqrt(fan_in) so activations are O(1) (realistic) -> errors are meaningful.
+    # 用 1/sqrt(fan_in) 缩放, 使激活量级为 O(1) (贴近真实), 误差量级才有意义.
+    Wg32 = torch.randn(d_inter, d_model) / (d_model ** 0.5)
+    Wu32 = torch.randn(d_inter, d_model) / (d_model ** 0.5)
+    Wd32 = torch.randn(d_model, d_inter) / (d_inter ** 0.5)
     # GPU-resident copies (bf16) derived from the SAME master / GPU 常驻副本 (bf16), 同源.
     WgG = Wg32.to(dev, dtype=gpu_dt)
     WuG = Wu32.to(dev, dtype=gpu_dt)
@@ -125,23 +127,39 @@ def build_expert(d_model, d_inter, dev, cpu_dt):
 # Correctness: split result vs full-GPU result max-abs-error / 正确性: 切分 vs 整专家 GPU 的最大绝对误差
 # ----------------------------------------------------------------------------
 def check_correctness(W, h, dev, cpu_dt):
+    """Two precision-honest checks / 两个精度诚实的校验:
+    (A) exact: all-fp32 split vs all-fp32 whole-expert -> must be ~0 (proves SAME expert math).
+        精确: 全 fp32 切分 vs 全 fp32 整专家 -> 必须 ~0 (证明切分计算的是同一个专家).
+    (B) deployed: bf16-GPU+cpu_dt-CPU split vs bf16-GPU whole-expert reference (the actual gap
+        a deployment would see, dominated by bf16 rounding, NOT by the split itself).
+        部署态: bf16-GPU+cpu_dt-CPU 切分 vs bf16-GPU 整专家参考 (部署实际差距, 由 bf16 舍入主导, 非切分引入).
+    """
     gpu_dt = torch.bfloat16
-    # Reference: whole expert fully on GPU bf16 / 参考: 整专家 GPU bf16.
-    a = F.linear(h, W["WgG"])
-    b = F.linear(h, W["WuG"])
-    m = F.silu(a) * b
-    y_full = F.linear(m, W["WdG"]).float().cpu()
-    # split_gateup_resident: GPU m -> CPU down / GPU 算 m, CPU 算 down.
-    m_cpu = m.to(dtype=cpu_dt).cpu()
+
+    # (A) exact all-fp32 reference and splits / (A) 全 fp32 参考与切分.
+    h32 = h.float().cpu()
+    Wg, Wu, Wd = W["Wg32"], W["Wu32"], W["Wd32"]
+    m32 = F.silu(F.linear(h32, Wg)) * F.linear(h32, Wu)
+    y32_full = F.linear(m32, Wd)
+    y32_split_gu = F.linear(m32, Wd)          # gate/up on host then down on host (same numbers)
+    err_exact = float((y32_split_gu - y32_full).abs().max())
+
+    # (B) deployed reference: whole expert on GPU bf16 / (B) 部署参考: 整专家 GPU bf16.
+    m_bf = F.silu(F.linear(h, W["WgG"])) * F.linear(h, W["WuG"])
+    y_ref = F.linear(m_bf, W["WdG"]).float().cpu()
+    rel = y_ref.abs().mean().clamp_min(1e-9)
+    # split_gateup_resident: GPU m (bf16) -> CPU down (cpu_dt) / GPU 算 m, CPU 算 down.
+    m_cpu = m_bf.to(dtype=cpu_dt).cpu()
     y_split_gu = F.linear(m_cpu, W["WdC"]).float()
-    # split_down_resident: CPU m -> GPU down / CPU 算 m, GPU 算 down.
+    # split_down_resident: CPU m (cpu_dt) -> GPU down (bf16) / CPU 算 m, GPU 算 down.
     h_cpu = h.to(dtype=cpu_dt).cpu()
     m_cpu2 = F.silu(F.linear(h_cpu, W["WgC"])) * F.linear(h_cpu, W["WuC"])
     y_split_dn = F.linear(m_cpu2.to(dev, dtype=gpu_dt), W["WdG"]).float().cpu()
     return {
-        "err_split_gateup_resident": float((y_split_gu - y_full).abs().max()),
-        "err_split_down_resident": float((y_split_dn - y_full).abs().max()),
-        "ref_abs_mean": float(y_full.abs().mean()),
+        "err_exact_fp32_split_vs_full": err_exact,
+        "relerr_deployed_split_gateup": float((y_split_gu - y_ref).abs().max() / rel),
+        "relerr_deployed_split_down": float((y_split_dn - y_ref).abs().max() / rel),
+        "ref_abs_mean": float(y_ref.abs().mean()),
     }
 
 
@@ -382,9 +400,11 @@ def main():
         W = build_expert(dm, di, dev, cpu_dt)
         h_chk = torch.randn(1, dm, device=dev, dtype=torch.bfloat16)
         corr = check_correctness(W, h_chk, dev, cpu_dt)
-        print(f"[correctness] err(split_gateup)={corr['err_split_gateup_resident']:.3e} "
-              f"err(split_down)={corr['err_split_down_resident']:.3e} "
-              f"(ref|mean|={corr['ref_abs_mean']:.3e})", flush=True)
+        print(f"[correctness] exact_fp32_split_vs_full={corr['err_exact_fp32_split_vs_full']:.3e} "
+              f"(must be ~0) | deployed_relerr split_gateup="
+              f"{corr['relerr_deployed_split_gateup']:.3e} "
+              f"split_down={corr['relerr_deployed_split_down']:.3e} "
+              f"(bf16-dominated; ref|mean|={corr['ref_abs_mean']:.3e})", flush=True)
 
         lat = bench_paths(W, dm, di, dev, cpu_dt, a.iters)
         base = lat["full_cpu_ms"]
