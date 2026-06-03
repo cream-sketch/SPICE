@@ -72,7 +72,7 @@ def simulate(seq, n_layers, n_experts, cap_objs, policy, pop, t_hit, t_cpu, t_at
             else:
                 objs.append(((l, e), pop[l, e]))
     objs.sort(key=lambda x: -x[1])
-    cache = set(k for k, _ in objs[:cap_objs])
+    cache = set() if policy == "cpu_fiddler" else set(k for k, _ in objs[:cap_objs])  # fiddler = no cache floor
     last_used = {k: 0 for k in cache}
 
     def nxt(k, pos):
@@ -103,11 +103,13 @@ def simulate(seq, n_layers, n_experts, cap_objs, policy, pop, t_hit, t_cpu, t_at
                     for k in keys: last_used[k] = pos
                 else:
                     cpu += 1; total += t_cpu          # exact Fiddler serve
-                    for k in keys:                     # admit (cache the object(s))
-                        if k not in cache:
-                            while len(cache) >= cap_objs and cache: evict(pos)
-                            if cap_objs >= 1: cache.add(k)
-                        last_used[k] = pos
+                    if policy == "oracle_matrix":     # only oracle admits dynamically (Belady)
+                        for k in keys:
+                            if k not in cache:
+                                while len(cache) >= cap_objs and cache: evict(pos)
+                                if cap_objs >= 1: cache.add(k)
+                            last_used[k] = pos
+                    # static policies (cpu_fiddler/whole_cache/matrix_cache): keep popularity-warm set, no admit
                 pos += (3 if matrix else 1)
     return total, len(seq), hits, cpu
 
