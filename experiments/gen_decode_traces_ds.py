@@ -58,17 +58,19 @@ def main():
     for pi, t in enumerate(texts):
         enc = tok(t, return_tensors="pt", truncation=True, max_length=a.prompt_len).to(dev)
         ids = enc["input_ids"]; past = None; cur = ids; steps = []
+        attn = enc["attention_mask"]  # DeepSeek custom code asserts attention_mask is not None
         with torch.no_grad():
             for g in range(a.gen):
                 STASH.clear()
                 out_m = model(input_ids=cur if past is None else cur[:, -1:],
-                              past_key_values=past, use_cache=True, return_dict=True)
+                              attention_mask=attn, past_key_values=past, use_cache=True, return_dict=True)
                 past = out_m.past_key_values
                 nxt = int(out_m.logits[0, -1].argmax().item())
                 per_layer = list(STASH[-L_moe:])  # this forward's MoE-layer top-k (last token)
                 if len(per_layer) == L_moe:
                     steps.append((nxt, per_layer))
                 cur = torch.tensor([[nxt]], device=dev)
+                attn = torch.cat([attn, torch.ones((1, 1), dtype=attn.dtype, device=dev)], dim=1)  # grow mask
                 if nxt == tok.eos_token_id:
                     break
         torch.save({"steps": steps, "prompt_ids": ids.cpu().tolist(), "num_layers": L_moe},
