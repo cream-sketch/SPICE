@@ -66,9 +66,10 @@ def main():
                               attention_mask=attn, past_key_values=past, use_cache=True, return_dict=True)
                 past = out_m.past_key_values
                 nxt = int(out_m.logits[0, -1].argmax().item())
-                per_layer = list(STASH[-L_moe:])  # this forward's MoE-layer top-k (last token)
-                if len(per_layer) == L_moe:
-                    steps.append((nxt, per_layer))
+                # hard assert (codex): exactly L_moe gate captures per forward, else trace is corrupt
+                assert len(STASH) == L_moe and L_moe > 0, f"expected {L_moe} gate captures, got {len(STASH)}"
+                per_layer = list(STASH)  # this forward's MoE-layer top-k (last token), in layer order
+                steps.append((nxt, per_layer))
                 cur = torch.tensor([[nxt]], device=dev)
                 attn = torch.cat([attn, torch.ones((1, 1), dtype=attn.dtype, device=dev)], dim=1)  # grow mask
                 if nxt == tok.eos_token_id:

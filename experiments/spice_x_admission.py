@@ -91,15 +91,12 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, B, layer_marg,
         occ_ptr[key] = p
         return len(ps) - p  # remaining occurrences after pos
 
-    # static-resident set for cpu_always (top-popularity per layer)
-    resident_static = set()
-    if policy == "cpu_always":
-        n_res = capacity
-        flatpop = [((l, e), pop[l, e]) for l in range(n_layers) for e in range(n_experts)]
-        flatpop.sort(key=lambda x: -x[1])
-        resident_static = set(k for k, _ in flatpop[:n_res])
-
-    cache = set(resident_static)  # dynamic cache (for cpu_always it's the static set, never changes)
+    # FAIRNESS (codex): ALL policies start from the SAME warm top-popularity resident cache.
+    # cpu_always keeps it static (never admits); others evolve it via admit+LS-evict.
+    flatpop = [((l, e), pop[l, e]) for l in range(n_layers) for e in range(n_experts)]
+    flatpop.sort(key=lambda x: -x[1])
+    warm = set(k for k, _ in flatpop[:capacity])
+    cache = set(warm)
     last_used = {k: 0 for k in cache}; key_layer = {k: k[0] for k in cache}
 
     def ls_dist(k, cur_layer):
@@ -148,11 +145,11 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, B, layer_marg,
             hits += len(resident_routed)
             for e in resident_routed:
                 last_used[(l, e)] = pos
-            # cost DAG (codex-corrected): demand-fetch is predecessor of its GPU compute, not a branch
-            gpu_ready = c["t_shared"] + len(resident_routed) * c["t_gpu"]
-            fetch_done = f_layer * c["t_fetch"]
-            gpu_done = max(gpu_ready, fetch_done) + f_layer * c["t_gpu"]
-            expert_region = max(gpu_done, cpu_burst(cpu_layer))
+            # cost: three-resource overlap (codex: barrier over-penalizes multi-fetch; model copy||GPU||CPU
+            # as parallel resources -> region = max of the three. Fair to fetch_all, conservative for our claim).
+            copy_t = f_layer * c["t_fetch"]
+            gpu_t = c["t_shared"] + (len(resident_routed) + f_layer) * c["t_gpu"]
+            expert_region = max(copy_t, gpu_t, cpu_burst(cpu_layer))
             tpot_ms += c["t_attn"] + c["t_gate"] + expert_region
             pos += len(routed)
     return {"tpot_ms": tpot_ms, "n_fetch": n_fetch, "n_cpu": n_cpu, "hits": hits,
@@ -165,7 +162,8 @@ def main():
     seqs, n_layers, n_experts = load_sequences(a.trace_dir)
     n_train = max(1, int(round(a.train_frac * len(seqs))))
     train, test = seqs[:n_train], seqs[n_train:]
-    if not test: test = train[-1:]
+    if not test:  # fail-fast (codex): never evaluate on training sequences
+        raise ValueError(f"empty test split (train_frac={a.train_frac}, n_seq={len(seqs)}); lower train_frac")
     A, layer_marg = build_A(train, n_layers, n_experts, a.alpha)
     B = build_B(train, n_layers, n_experts, a.alpha, layer_marg)
     pop = popularity(train, n_layers, n_experts)
@@ -205,18 +203,22 @@ def main():
     for x in rows: by[x["residency"]][x["policy"]] = x
     verdict = {}
     for r, d in by.items():
-        fa = d["fetch_all"]["tpot_ms"]; ca = d["cpu_always"]["tpot_ms"]; orc = d["oracle_admit"]["tpot_ms"]
-        toks = {k: v for k, v in d.items() if k.startswith("token_admit")}
-        best_tok = min(toks.values(), key=lambda x: x["tpot_ms"])
-        bt = best_tok["tpot_ms"]
-        baseline = min(fa, ca)
-        share = (baseline - bt) / (baseline - orc) if (baseline - orc) > 1e-9 else 0.0
-        verdict[str(r)] = {"fetch_all": fa, "cpu_always": ca, "oracle": orc, "best_token": bt,
-                           "best_token_label": best_tok["policy"],
-                           "token_beats_baseline": bt < baseline,
+        fa = d["fetch_all"]; ca = d["cpu_always"]; orc = d["oracle_admit"]
+        toks = [v for k, v in d.items() if k.startswith("token_admit")]
+        # best_token = min TPOT; matched_token = token run whose H2D bytes closest to oracle's (fair budget)
+        best_tok = min(toks, key=lambda x: x["tpot_ms"])
+        matched_tok = min(toks, key=lambda x: abs(x["h2d_mb_per_tok"] - orc["h2d_mb_per_tok"]))
+        baseline = min(fa["tpot_ms"], ca["tpot_ms"])
+        share = (baseline - best_tok["tpot_ms"]) / (baseline - orc["tpot_ms"]) if (baseline - orc["tpot_ms"]) > 1e-9 else 0.0
+        verdict[str(r)] = {"fetch_all": fa["tpot_ms"], "cpu_always": ca["tpot_ms"], "oracle": orc["tpot_ms"],
+                           "best_token": best_tok["tpot_ms"], "best_token_label": best_tok["policy"],
+                           "matched_token": matched_tok["tpot_ms"], "matched_token_label": matched_tok["policy"],
+                           "oracle_h2d": orc["h2d_mb_per_tok"], "matched_token_h2d": matched_tok["h2d_mb_per_tok"],
+                           "token_beats_baseline": best_tok["tpot_ms"] < baseline,
                            "token_share_of_oracle_headroom": share}
-        print(f"res={r}: fetch_all={fa:.3f} cpu_always={ca:.3f} oracle={orc:.3f} best_token={bt:.3f}"
-              f"({best_tok['policy']}) | token<min(fa,ca)={bt<baseline} share_of_oracle={share:+.1%}", flush=True)
+        print(f"res={r}: fa={fa['tpot_ms']:.2f} cpu_always={ca['tpot_ms']:.2f} oracle={orc['tpot_ms']:.2f} "
+              f"best_token={best_tok['tpot_ms']:.2f}({best_tok['policy']}) | beats_min(fa,ca)={best_tok['tpot_ms']<baseline} "
+              f"share_oracle={share:+.0%}", flush=True)
     Path(a.out).write_text(json.dumps({"rows": rows, "verdict": verdict}, indent=2))
 
 
