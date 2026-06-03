@@ -1,0 +1,30 @@
+{
+  "config": {
+    "gpu": 0,
+    "n_layers": 26,
+    "d_model": 2048,
+    "d_inter": 1408,
+    "n_experts": 64,
+    "top_k": 6,
+    "n_heads": 16,
+    "ctx_len": 512,
+    "decode_tokens": 80,
+    "cpu_threads": 16,
+    "target_residual_rate": 0.2576,
+    "fetch_frac": 0.33,
+    "trace_dir": "/home/ziheng/workspace/spice_runs/ds_decode_big",
+    "out": "../../notes/evidence/int_deepseek.json",
+    "cpu_dtype": "bf16",
+    "seed": 0
+  },
+  "T": 80,
+  "residual_miss_per_tok": 39.8625,
+  "hits_per_tok": 116.1375,
+  "effective_residual_rate": 0.25552884615384613,
+  "tpot_prefetch_sync_ms": 122.10230549972039,
+  "tpot_prefetch_cpu_ms": 91.38629366279929,
+  "tpot_prefetch_capacity_ms": 113.89964767440688,
+  "capacity_vs_sync_pct": 6.717856629932587,
+  "cpu_vs_sync_pct": 25.155963854418324,
+  "capacity_vs_cpu_pct": -24.63537266833278
+}
