@@ -33,15 +33,27 @@ def parse_args():
 
 
 def load_sequences(trace_dir):
-    """Return list of sequences; each = list of (token_id, [layer][top_k experts]). num_layers, num_experts."""
+    """Return sequences as list of (INPUT_token_id, [layer][top_k]). codex alignment fix:
+    gen_decode_traces saves (generated_tid_g, per_layer_g) where per_layer_g is the routing of the
+    INPUT token x_g, and x_g = generated_tid_{g-1} (x_0 = last prompt token). So we shift: the token
+    that PRODUCED per_layer_g (and is known BEFORE that forward) is generated_tid_{g-1}.
+    This makes A/B/simulate use only the realizable, correctly-aligned input token."""
     files = sorted(glob.glob(str(Path(trace_dir) / "dec_*.pt")))
     man = json.loads((Path(trace_dir) / "manifest.json").read_text())
     n_layers = man["num_layers"]; n_experts = man["experts"]
     seqs = []
     for f in files:
         d = torch.load(f, map_location="cpu", weights_only=False)
-        steps = d["steps"]  # list of (token_id, [L][top_k])
-        seq = [(int(tid), [[int(e) for e in topk] for topk in per_layer]) for (tid, per_layer) in steps]
+        steps = d["steps"]  # list of (generated_tid, [L][top_k])
+        prompt_ids = d["prompt_ids"]
+        prev_out = int(prompt_ids[0][-1])  # x_0 = last prompt token
+        seq = []
+        for (gen_tid, per_layer) in steps:
+            if any(sl is None for sl in per_layer):  # guard: skip incomplete capture
+                prev_out = int(gen_tid); continue
+            plist = [[int(e) for e in topk] for topk in per_layer]
+            seq.append((prev_out, plist))   # (input_tid_g = produced per_layer_g, routing_g)
+            prev_out = int(gen_tid)          # next step's input = this step's output
         if seq: seqs.append(seq)
     return seqs, n_layers, n_experts
 
