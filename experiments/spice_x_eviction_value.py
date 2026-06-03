@@ -65,12 +65,31 @@ def build_A(train_seqs, n_layers, n_experts, alpha):
     return A, layer_marg
 
 
-def a_lookup(A, layer_marg, l, tid, e):
-    v = A.get((l, tid))
+def build_B(train_seqs, n_layers, n_experts, alpha, layer_marg):
+    """REALIZABLE cross-token transition table (codex leakage fix): B[layer][token_id] ->
+    P(next token uses expert e at layer j | CURRENT token id = v). Built from consecutive token
+    pairs in train. Usable during current token's forward (v_cur known; v_next NOT known)."""
+    btok_cnt = defaultdict(lambda: np.zeros(n_experts, dtype=np.float64))
+    btok_tot = defaultdict(float)
+    for seq in train_seqs:
+        for ti in range(len(seq) - 1):
+            v_cur = seq[ti][0]; nxt_per_layer = seq[ti + 1][1]
+            for l, topk in enumerate(nxt_per_layer):
+                for e in topk:
+                    btok_cnt[(l, v_cur)][e] += 1.0
+                btok_tot[(l, v_cur)] += len(topk)
+    B = {}
+    for (l, v), c in btok_cnt.items():
+        B[(l, v)] = (c + alpha * layer_marg[l]) / (btok_tot[(l, v)] + alpha)
+    return B
+
+
+def a_lookup(tbl, layer_marg, l, tid, e):
+    v = tbl.get((l, tid))
     return float(v[e]) if v is not None else float(layer_marg[l, e])
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, A, layer_marg, rho):
+def simulate(seq, n_layers, n_experts, capacity, policy, A, B, layer_marg, rho):
     """Replay one sequence's (layer,expert) stream under a policy. Return (hits, misses).
     Stream order = token by token, layer 0..L-1, experts within a layer. token context available."""
     # flatten with token index + per-position token ids
@@ -102,13 +121,13 @@ def simulate(seq, n_layers, n_experts, capacity, policy, A, layer_marg, rho):
         return n_layers if d == 0 else d
 
     def value(k, cur_layer, cur_tok):
-        """Survival next-use prob: within-token (current token future layers j>cur_layer)
-        + cross-token (next token same layer j). Higher = keep. Evict argmin."""
+        """REALIZABLE survival next-use prob (codex leakage fix): within-token uses current token id
+        (known) for its future layers j>cur_layer; cross-token uses transition table B[j,v_cur,e]
+        (P next token uses (j,e) | current token) -- does NOT peek at v_{t+1}. Higher = keep."""
         j, e = k
-        within = a_lookup(A, layer_marg, j, tok_ids[cur_tok], e) if j > cur_layer else 0.0
-        cross = 0.0
-        if cur_tok + 1 < len(tok_ids):
-            cross = rho * a_lookup(A, layer_marg, j, tok_ids[cur_tok + 1], e)
+        v_cur = tok_ids[cur_tok]
+        within = a_lookup(A, layer_marg, j, v_cur, e) if j > cur_layer else 0.0
+        cross = rho * a_lookup(B, layer_marg, j, v_cur, e)  # transition, realizable for all j
         return 1.0 - (1.0 - within) * (1.0 - min(cross, 1.0))
 
     def evict(cur_layer, pos, cur_tok):
@@ -144,6 +163,7 @@ def main():
     train, test = seqs[:n_train], seqs[n_train:]
     if not test: test = train[-1:]
     A, layer_marg = build_A(train, n_layers, n_experts, a.alpha)
+    B = build_B(train, n_layers, n_experts, a.alpha, layer_marg)
     # cap test tokens
     tot = 0; test2 = []
     for s in test:
@@ -155,14 +175,17 @@ def main():
 
     total = n_layers * n_experts
     residencies = [float(x) for x in a.residency.split(",")]
-    policies = ["lru", "specmd_ls", "value", "oracle_belady"]
+    policies = ["lru", "specmd_ls", "value_within", "value", "oracle_belady"]
     rows = []
     for r in residencies:
         cap = max(1, int(round(r * total)))
         for pol in policies:
             h = m = 0
+            # value_within = within-token only (rho=0): isolates within-token A contribution
+            rho_use = 0.0 if pol == "value_within" else a.rho
+            pol_run = "value" if pol == "value_within" else pol
             for s in test:
-                hi, mi = simulate(s, n_layers, n_experts, cap, pol, A, layer_marg, a.rho)
+                hi, mi = simulate(s, n_layers, n_experts, cap, pol_run, A, B, layer_marg, rho_use)
                 h += hi; m += mi
             hr = h / max(1, h + m)
             rows.append({"residency": r, "capacity": cap, "policy": pol, "hit_rate": hr,
