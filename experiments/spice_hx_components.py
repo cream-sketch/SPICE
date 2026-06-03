@@ -58,38 +58,30 @@ class Timer:
 
 
 def measure_components(model, tok, device, decode_tokens):
-    """Real decode forward with hooks on attn/gate/shared/one-expert to get per-call GPU times."""
-    layers = model.model.layers
-    timer = Timer()
-    # hook layer-0 sub-modules as representative (homogeneous across layers)
-    l0 = layers[0]
-    timer.hook(l0.self_attn, "attn")
-    timer.hook(l0.mlp.gate, "gate")
-    timer.hook(l0.mlp.shared_expert, "shared")
-    timer.hook(l0.mlp.experts[0], "expert_gpu")  # times only when expert0 is routed; representative
-    # also hook ALL experts of layer0 to capture per-call cost regardless of which fire
-    for j, ex in enumerate(l0.mlp.experts):
-        timer.hook(ex, f"exp_{j}")
-
-    ids = tok("The history of computing began", return_tensors="pt").input_ids.to(device)
+    """DECODE-ONLY per-call GPU times. Critical: warm up (prefill + several decode steps) BEFORE
+    registering hooks, so neither prefill (multi-token) nor CUDA/cuBLAS warmup contaminates the mean.
+    Hooks fire once per decode step (batch=1, seq=1) -> clean per-token component cost."""
+    l0 = model.model.layers[0]
+    ids = tok("The history of computing began in the early twentieth century with", return_tensors="pt").input_ids.to(device)
     with torch.no_grad():
-        out = model(ids, use_cache=True)
+        out = model(ids, use_cache=True)           # prefill (NOT hooked)
         past = out.past_key_values
         nxt = out.logits[:, -1:].argmax(-1)
-        for _ in range(decode_tokens):
+        for _ in range(8):                          # warmup decode (NOT hooked)
             out = model(nxt, past_key_values=past, use_cache=True)
-            past = out.past_key_values
-            nxt = out.logits[:, -1:].argmax(-1)
+            past = out.past_key_values; nxt = out.logits[:, -1:].argmax(-1)
+        torch.cuda.synchronize()
+        timer = Timer()                             # register hooks AFTER warmup
+        timer.hook(l0.self_attn, "attn"); timer.hook(l0.mlp.gate, "gate"); timer.hook(l0.mlp.shared_expert, "shared")
+        for j, ex in enumerate(l0.mlp.experts): timer.hook(ex, f"exp_{j}")
+        for _ in range(decode_tokens):              # timed decode steps (seq_len=1)
+            out = model(nxt, past_key_values=past, use_cache=True)
+            past = out.past_key_values; nxt = out.logits[:, -1:].argmax(-1)
     s = timer.summary_ms()
-    # aggregate per-expert-call cost across all layer0 experts
     exp_calls = [v for k, v in s.items() if k.startswith("exp_")]
-    expert_gpu_ms = float(np.mean([v["mean_ms"] for v in exp_calls])) if exp_calls else s.get("expert_gpu", {}).get("mean_ms", 0.0)
-    return {
-        "t_attn_ms": s["attn"]["mean_ms"],
-        "t_gate_ms": s["gate"]["mean_ms"],
-        "t_shared_ms": s["shared"]["mean_ms"],
-        "t_expert_gpu_ms": expert_gpu_ms,
-    }
+    expert_gpu_ms = float(np.mean([v["mean_ms"] for v in exp_calls])) if exp_calls else 0.0
+    return {"t_attn_ms": s["attn"]["mean_ms"], "t_gate_ms": s["gate"]["mean_ms"],
+            "t_shared_ms": s["shared"]["mean_ms"], "t_expert_gpu_ms": expert_gpu_ms}
 
 
 def measure_cpu_expert(model, device):
@@ -143,7 +135,7 @@ def measure_overlap(model, device):
     xc = torch.randn(1, g.shape[1])
     def cpu_work(rounds):
         for _ in range(rounds): F.linear(F.silu(F.linear(xc, g)) * F.linear(xc, u), d)
-    RG, RC = 2000, 200
+    RG, RC = 2000, 3000  # balanced so t_gpu ~ t_cpu (~0.4s each); imbalanced test hides true overlap
     gpu_work(10); cpu_work(10)
     t0 = time.perf_counter(); gpu_work(RG); t_gpu = time.perf_counter() - t0
     t0 = time.perf_counter(); cpu_work(RC); t_cpu = time.perf_counter() - t0
@@ -207,20 +199,33 @@ def main():
     residencies = [float(x) for x in a.residency.split(",")]
     miss = miss_counts_from_traces(a.trace_dir, a.max_traces, residencies, n_experts, n_layers)
 
-    # verdict: hideable GPU per layer vs CPU-miss cost per layer
+    # verdict: per-layer critical path. CORRECTED: attn+gate are SEQUENTIAL before experts (expert
+    # input = post-attention hidden) -> NOT hideable behind CPU-miss compute. Only same-layer GPU
+    # expert work (shared + resident routed) overlaps CPU misses.
+    L = n_layers
+    a_, g_, s_, eg, ec, cp = (comp["t_attn_ms"], comp["t_gate_ms"], comp["t_shared_ms"],
+                              comp["t_expert_gpu_ms"], comp["t_expert_cpu_ms"], comp["t_copy_h2d_ms"])
+    pre = a_ + g_  # sequential prefix per layer
     verdict = {}
     for r, st in miss.items():
-        n_res_routed = top_k - st["mean_miss_per_layer"]  # routed experts that hit GPU
-        hideable = comp["t_attn_ms"] + comp["t_gate_ms"] + comp["t_shared_ms"] + comp["t_expert_gpu_ms"] * max(0.0, n_res_routed)
-        cpu_miss_mean = comp["t_expert_cpu_ms"] * st["mean_miss_per_layer"]
-        cpu_miss_p90 = comp["t_expert_cpu_ms"] * st["p90"]
+        nm = st["mean_miss_per_layer"]; nres = top_k - nm  # resident routed hits
+        hideable = s_ + eg * max(0.0, nres)                # GPU expert work parallel to CPU misses
+        cpu_miss = ec * nm
+        # per-layer expert-region cost under each policy
+        reg_fetch = s_ + top_k * eg + nm * cp              # B0: fetch miss weight, compute on GPU (fetch on crit path)
+        reg_cpu_overlap = max(hideable, cpu_miss)          # B1: CPU miss compute overlaps GPU expert work
+        reg_cpu_serial = hideable + cpu_miss               # B1 if overlap fails (GIL serialize)
+        reg_prefetch_bound = s_ + top_k * eg               # oracle: all misses prefetched resident (free)
+        tpot = lambda reg: L * (pre + reg)
         verdict[r] = {
-            "hideable_gpu_ms": hideable,
-            "cpu_miss_mean_ms": cpu_miss_mean,
-            "cpu_miss_p90_ms": cpu_miss_p90,
-            "exposed_stall_mean_ms": max(0.0, cpu_miss_mean - hideable),
-            "exposed_stall_p90_ms": max(0.0, cpu_miss_p90 - hideable),
-            "GO_has_exposed_stall": (cpu_miss_p90 - hideable) > 0,
+            "mean_miss_per_layer": nm,
+            "exposed_cpu_stall_per_layer_ms": max(0.0, cpu_miss - hideable),
+            "TPOT_B0_fetch_all_ms": tpot(reg_fetch),
+            "TPOT_B1_cpu_overlap_ms": tpot(reg_cpu_overlap),
+            "TPOT_B1_cpu_serial_ms": tpot(reg_cpu_serial),
+            "TPOT_prefetch_bound_ms": tpot(reg_prefetch_bound),
+            "headroom_B1overlap_vs_prefetchbound_pct": 100.0 * (tpot(reg_cpu_overlap) - tpot(reg_prefetch_bound)) / tpot(reg_cpu_overlap),
+            "GO_headroom_over_5pct": (tpot(reg_cpu_overlap) - tpot(reg_prefetch_bound)) / tpot(reg_cpu_overlap) > 0.05,
         }
 
     result = {"components_ms": comp, "overlap": ov, "miss_counts": miss, "verdict": verdict}
