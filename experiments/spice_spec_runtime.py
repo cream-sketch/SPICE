@@ -30,6 +30,7 @@ def parse_args():
     ap.add_argument("--ks", type=str, required=True, help="comma list of speculative K (1=AR baseline)")
     ap.add_argument("--steps", type=int, required=True, help="number of target forwards to time per K")
     ap.add_argument("--accept_rate", type=float, required=True, help="avg fraction of K drafted tokens accepted")
+    ap.add_argument("--draft_ms_per_tok", type=float, required=True, help="SPICE draft cost per drafted token (ms); added to TPOT for K>1")
     ap.add_argument("--cpu_threads", type=int, required=True)
     ap.add_argument("--trace_dir", required=True)
     ap.add_argument("--out", required=True)
@@ -62,8 +63,10 @@ def main():
                                        torch.randn(di, dm, device=dev, dtype=dt),
                                        torch.randn(dm, di, device=dev, dtype=dt))
             idx += 1
-    # CPU host weights for missed experts (one shared bank; timing-real)
-    cpu_g = torch.randn(di, dm); cpu_u = torch.randn(di, dm); cpu_d = torch.randn(dm, di)
+    # CPU host weights for missed experts: DISTINCT bank (codex fix: shared bank -> L3 cache artifact).
+    # NBANK distinct expert weight sets (>> LLC) so missed-expert reads hit distinct DRAM regions.
+    NBANK = 256
+    cpu_bank = [(torch.randn(di, dm), torch.randn(di, dm), torch.randn(dm, di)) for _ in range(NBANK)]
 
     f = sorted(glob.glob(str(Path(a.trace_dir) / "dec_*.pt")))[0]
     d = torch.load(f, map_location="cpu", weights_only=False)
@@ -84,8 +87,9 @@ def main():
     def gpu_expert_b(w, hb):
         g, u, dd = w; return F.linear(F.silu(F.linear(hb, g)) * F.linear(hb, u), dd)
 
-    def cpu_serve_grouped(hc):  # hc: (m, dm) positions routing to one missed expert -> (m, dm)
-        return F.linear(F.silu(F.linear(hc, cpu_g)) * F.linear(hc, cpu_u), cpu_d)
+    def cpu_serve_grouped(hc, l, e):  # hc: (m, dm); use the expert's OWN distinct bank weights (real DRAM)
+        g, u, dd = cpu_bank[(l * a.n_experts + e) % NBANK]
+        return F.linear(F.silu(F.linear(hc, g)) * F.linear(hc, u), dd)
 
     def run_K(K):
         torch.cuda.synchronize(dev)
@@ -109,13 +113,17 @@ def main():
                         oe = gpu_expert_b(gpu_experts[(l, e)], sub)
                         out.index_add_(0, torch.tensor(plist, device=dev), oe.to(dt))
                     else:
-                        oc = cpu_serve_grouped(sub.float().cpu())  # CPU grouped over positions (real)
+                        oc = cpu_serve_grouped(sub.float().cpu(), l, e)  # CPU grouped, distinct-bank weights (real)
                         out.index_add_(0, torch.tensor(plist, device=dev), oc.to(dev, dtype=dt))
                 hb = hb + out
         torch.cuda.synchronize(dev)
         step_ms = (time.perf_counter() - t0) / a.steps * 1000.0
-        accepted = max(1.0, K * a.accept_rate) if K > 1 else 1.0
-        return step_ms, step_ms / accepted
+        if K > 1:
+            accepted = max(1.0, K * a.accept_rate)
+            tpot = (step_ms + K * a.draft_ms_per_tok) / accepted   # include serial draft cost (codex fix)
+        else:
+            tpot = step_ms
+        return step_ms, tpot
 
     res = {"config": vars(a), "n_resident": n_res, "rows": []}
     run_K(2)  # warmup
