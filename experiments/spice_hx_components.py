@@ -122,6 +122,38 @@ def measure_copy_h2d(model, device):
     return s_ev.elapsed_time(e_ev) / n, mb
 
 
+def measure_cpu_concurrent(model, max_n):
+    """Does CPU compute N missed experts in PARALLEL (threadpool) or SERIAL? Decides cpu_miss scaling.
+    If wall time for N experts ~ 1x single-expert -> parallel -> no CPU bottleneck -> headroom vanishes.
+    If ~ N x -> serial -> CPU is the bottleneck at tight cache -> prefetch headroom is real."""
+    from concurrent.futures import ThreadPoolExecutor
+    weights = []
+    for j in range(max_n):
+        ex = model.model.layers[0].mlp.experts[j]
+        weights.append((ex.gate_proj.weight.detach().float().cpu(),
+                        ex.up_proj.weight.detach().float().cpu(),
+                        ex.down_proj.weight.detach().float().cpu()))
+    x = torch.randn(1, weights[0][0].shape[1])
+    def run_one(w): g, u, d = w; return F.linear(F.silu(F.linear(x, g)) * F.linear(x, u), d)
+    for _ in range(5):
+        for w in weights: run_one(w)
+    res = {}
+    pool = ThreadPoolExecutor(max_workers=max_n)
+    for n in range(1, max_n + 1):
+        ws = weights[:n]
+        t0 = time.perf_counter()
+        for _ in range(30):
+            for w in ws: run_one(w)             # serial loop (Fiddler style)
+        t_serial = (time.perf_counter() - t0) / 30 * 1000
+        t0 = time.perf_counter()
+        for _ in range(30):
+            list(pool.map(run_one, ws))         # threadpool (parallel attempt)
+        t_par = (time.perf_counter() - t0) / 30 * 1000
+        res[n] = {"serial_ms": t_serial, "threadpool_ms": t_par}
+    pool.shutdown()
+    return res
+
+
 def measure_overlap(model, device):
     """Does CPU expert compute overlap GPU work? Compare serial vs concurrent wall time.
     GPU work = a routed expert on GPU run many times; CPU work = a routed expert on CPU.
@@ -196,6 +228,7 @@ def main():
     t_copy, mb = measure_copy_h2d(model, device)
     comp["t_copy_h2d_ms"] = t_copy; comp["expert_MB"] = mb
     ov = measure_overlap(model, device)
+    cpu_conc = measure_cpu_concurrent(model, top_k)
     residencies = [float(x) for x in a.residency.split(",")]
     miss = miss_counts_from_traces(a.trace_dir, a.max_traces, residencies, n_experts, n_layers)
 
@@ -228,7 +261,7 @@ def main():
             "GO_headroom_over_5pct": (tpot(reg_cpu_overlap) - tpot(reg_prefetch_bound)) / tpot(reg_cpu_overlap) > 0.05,
         }
 
-    result = {"components_ms": comp, "overlap": ov, "miss_counts": miss, "verdict": verdict}
+    result = {"components_ms": comp, "overlap": ov, "cpu_concurrent_ms": cpu_conc, "miss_counts": miss, "verdict": verdict}
     Path(a.out).write_text(json.dumps(result, indent=2))
     print("\n===== SPICE-HX KILL-SHOT RESULT =====", flush=True)
     print(json.dumps(result, indent=2), flush=True)
