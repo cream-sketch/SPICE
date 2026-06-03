@@ -204,6 +204,31 @@ def main():
                          "slots": h + m})
             print(f"res={r:>5} cap={cap:>4} {pol:>14} hit={hr:.4f}", flush=True)
 
+    # per-sequence paired bootstrap CI on (value - LS) hit-rate gap (codex: slots highly correlated)
+    print("\n===== paired bootstrap CI (value - LS), per-sequence =====", flush=True)
+    boot = {}
+    rng = np.random.default_rng(0)
+    for r in residencies:
+        cap = max(1, int(round(r * total)))
+        per_seq = []  # (value_hits, value_slots, ls_hits, ls_slots) per sequence
+        for s in test:
+            vh, vm = simulate(s, n_layers, n_experts, cap, "value", A, B, layer_marg, a.rho)
+            lh, lm = simulate(s, n_layers, n_experts, cap, "specmd_ls", A, B, layer_marg, a.rho)
+            per_seq.append((vh, vh + vm, lh, lh + lm))
+        arr = np.array(per_seq, dtype=float)
+        n = len(arr)
+        diffs = []
+        for _ in range(2000):
+            idx = rng.integers(0, n, n)
+            b = arr[idx]
+            vhr = b[:, 0].sum() / max(1, b[:, 1].sum()); lhr = b[:, 2].sum() / max(1, b[:, 3].sum())
+            diffs.append(vhr - lhr)
+        lo, hi = np.percentile(diffs, [2.5, 97.5]); mean = float(np.mean(diffs))
+        boot[str(r)] = {"mean_gap": mean, "ci95_lo": float(lo), "ci95_hi": float(hi), "n_seq": n,
+                        "significant": bool(lo > 0)}
+        print(f"res={r}: value-LS mean={mean:+.4f} CI95=[{lo:+.4f},{hi:+.4f}] "
+              f"{'SIGNIFICANT(>0)' if lo>0 else 'not sig' if hi>0 else 'SIG NEGATIVE'}", flush=True)
+
     # verdict: value vs LS gap, and value's share of (Belady - LS) headroom
     print("\n===== VALUE vs LS verdict =====", flush=True)
     by = defaultdict(dict)
@@ -219,7 +244,7 @@ def main():
         print(f"res={r}: LS={ls:.4f} VALUE={val:.4f} Belady={bel:.4f} | "
               f"value-LS={val-ls:+.4f} share_of_headroom={share:+.2%} "
               f"{'GO' if (val-ls)>0.005 else 'NO-GO(~=LS)'}", flush=True)
-    Path(a.out).write_text(json.dumps({"rows": rows, "verdict": verdict}, indent=2))
+    Path(a.out).write_text(json.dumps({"rows": rows, "verdict": verdict, "bootstrap": boot}, indent=2))
 
 
 if __name__ == "__main__":
