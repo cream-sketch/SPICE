@@ -1,0 +1,8 @@
+{
+  "model": "/home/ziheng/sparmoe/models/Qwen1.5-MoE-A2.7B-Chat",
+  "positions": 3935,
+  "shared_only_argmax_agree": 0.04726810673443456,
+  "mean_margin_keep": 0.21995406393562594,
+  "mean_margin_flip": 0.06592370647013934,
+  "flip_rate": 0.9527318932655654
+}

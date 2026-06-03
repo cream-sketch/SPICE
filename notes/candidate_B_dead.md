@@ -1,0 +1,4 @@
+# Candidate B (selective routed execution) — DEAD (2026-06-02)
+Premise test (shared_only_argmax.py, Qwen, 3935 positions teacher-forced): dropping ALL routed experts (shared+attention only) changes the next-token argmax for 95.3% of tokens (only 4.7% agree). Routed experts are a ~10% hidden-norm perturbation BUT the LM head is sensitive -> 95% of argmax decisions need routed. So you CANNOT skip routed fetch for most tokens. B is dead.
+(margin keep 0.22 vs flip 0.066 -> shared-only confidence weakly separates, but base flip rate 95% kills any savings.)
+IMPLICATION: routed experts MUST be computed (can't skip) -> the only lever is making their movement/computation CHEAPER -> Candidate A (compute-placement: CPU-compute routed, move 8KB activations not 17MB weights; CPU DRAM 100GB/s >> PCIe; ~2000x data asymmetry). A is the surviving 'better way'. codex pressure-testing A vs Fiddler/HybriMoE/ktransformers.
