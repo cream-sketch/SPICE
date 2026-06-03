@@ -26,11 +26,14 @@ __global__ void gemv_zerocopy(const float* __restrict__ x, const float* __restri
     out[r] = acc;
 }
 
-// register a pinned host tensor as MAPPED, return its device pointer (as int64)
+// register a PLAIN (non-pinned) host tensor as MAPPED, return its device pointer (as int64)
 int64_t map_host(torch::Tensor w) {
     void* hp = w.data_ptr();
-    cudaHostRegister(hp, w.numel()*sizeof(float), cudaHostRegisterMapped);
-    void* dp = nullptr; cudaHostGetDevicePointer(&dp, hp, 0);
+    cudaError_t e1 = cudaHostRegister(hp, w.numel()*sizeof(float), cudaHostRegisterMapped);
+    TORCH_CHECK(e1 == cudaSuccess, "cudaHostRegister failed: ", cudaGetErrorString(e1));
+    void* dp = nullptr;
+    cudaError_t e2 = cudaHostGetDevicePointer(&dp, hp, 0);
+    TORCH_CHECK(e2 == cudaSuccess, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(e2));
     return (int64_t)dp;
 }
 void unmap_host(torch::Tensor w) { cudaHostUnregister(w.data_ptr()); }
@@ -66,15 +69,18 @@ def main():
     # one matrix (di x dm), fp32 for the simple kernel. Expert = 3 matrices; we time per-matrix x3.
     R, C = di, dm
     mat_mb = R * C * 4 / 1e6
-    Wh = torch.randn(R, C).contiguous().pin_memory()           # host pinned
-    Wg = Wh.to(dev)                                             # HBM-resident copy for baseline (BEFORE register)
-    wdev = m.map_host(Wh)                                       # mapped device ptr (zero-copy) -- register AFTER
+    Wh = torch.randn(R, C).contiguous()                        # PLAIN host tensor (not torch-pinned)
+    # allocate ALL device tensors FIRST (set up context), register host LAST
+    Wg = Wh.to(dev)                                             # HBM-resident copy for baseline
     x = torch.randn(C, device=dev); out = torch.empty(R, device=dev)
     Wh_dst = torch.empty(R, C, device=dev)                     # H2D dst
+    Wh_pin = Wh.pin_memory()                                    # separate pinned copy for H2D baseline
+    torch.cuda.synchronize(dev)
+    wdev = m.map_host(Wh)                                       # map the PLAIN host tensor (zero-copy) LAST
 
     def zc(): m.run_zerocopy(x, wdev, out, R, C); torch.cuda.synchronize(dev)
     def hbm_gemv(): torch.mv(Wg, x); torch.cuda.synchronize(dev)
-    def h2d_then_gemv(): Wh_dst.copy_(Wh, non_blocking=True); torch.mv(Wh_dst, x); torch.cuda.synchronize(dev)
+    def h2d_then_gemv(): Wh_dst.copy_(Wh_pin, non_blocking=True); torch.mv(Wh_dst, x); torch.cuda.synchronize(dev)
 
     def bench(fn):
         for _ in range(5): fn()
