@@ -908,6 +908,330 @@ eviction 很难超过 SpecMD-LS。
   重点不是 gate weight, 而是 resident 的 future-token next-use signal。
 ```
 
+## 2.8 候选: compute-placement miss-handling
+
+这个候选很强, 因为它不是在改 prefetch, 而是在改 miss 的执行位置:
+
+```text
+miss 时不搬 17MB expert weights 到 GPU,
+而是把几 KB hidden activation 送到 CPU,
+在权重所在地用 CPU 精确计算 expert,
+再把几 KB 输出/partial sum 回传 GPU。
+```
+
+传统 offloading miss:
+
+```text
+expert miss
+  -> CPU DRAM --(17MB weight H2D)--> GPU cache
+  -> GPU executes expert
+  -> maybe keep expert resident
+```
+
+compute-placement miss:
+
+```text
+expert miss
+  -> GPU --(hidden activation)--> CPU
+  -> CPU executes expert where weights already reside
+  -> CPU --(partial output)--> GPU
+  -> no GPU cache pollution
+```
+
+### 2.8.1 为什么它看起来很有力
+
+以 Qwen1.5-MoE-A2.7B 的 routed expert 形状估算:
+
+```text
+expert weights ~= 3 * 2048 * 1408 * 2 bytes ~= 16.5 MiB
+hidden activation ~= 2048 * 2 bytes ~= 4 KiB
+input + output ~= 8 KiB
+```
+
+权重 H2D fetch:
+
+```text
+17MB @ 5GB/s  ~= 3.3 ms
+17MB @ 12GB/s ~= 1.4 ms
+17MB @ 24GB/s ~= 0.7 ms
+```
+
+CPU exact expert 的 batch=1 下界主要是读一遍 weights:
+
+```text
+17MB / 100GB/s DRAM ~= 0.17 ms
+17MB / 50GB/s DRAM  ~= 0.34 ms
+```
+
+所以对于 one-shot miss、小 batch、低 PCIe 带宽, CPU compute 可能比 fetch-to-GPU 快 5-20x, 并且不占 cache slot。
+
+### 2.8.2 正确的数据流: 一层传一次 activation, 不是每个 expert 传一次
+
+更合理的数据流是 layer-level partial sum:
+
+```text
+GPU:
+  router selects top-k experts and gate weights
+  partition selected experts:
+    GPU-resident hits
+    CPU-placement misses
+    GPU-admitted misses
+
+  execute GPU-resident experts on GPU
+  if any CPU-placement miss:
+      send h_l once to CPU with selected expert ids + weights
+
+CPU:
+  for all CPU-placement selected experts:
+      compute w_i * E_i(h_l)
+  sum CPU-side partial routed output
+  return one partial vector to GPU
+
+GPU:
+  add GPU partial + CPU partial + shared expert
+```
+
+这比 "每个 miss expert 都传一次 8KB" 更好。实际 PCIe traffic 应接近:
+
+```text
+one hidden vector out + one partial output back + metadata per layer
+```
+
+### 2.8.3 它依赖什么信息
+
+compute-placement 的决策不是 "会不会用"。miss 已经证明它会用。它问的是:
+
+```text
+这个 miss 应该在哪里服务?
+CPU compute once, 还是 GPU fetch/cache?
+```
+
+需要的信息:
+
+```text
+current miss features:
+  selected expert id
+  layer
+  gate weight / rank / margin
+  number of CPU-placement misses in this layer
+
+hardware features:
+  CPU exact GEMV latency for this expert shape
+  D2H/H2D activation roundtrip latency
+  weight H2D latency
+  GPU cache pressure
+  CPU thread/NUMA queue
+  DMA queue
+
+future value features:
+  probability this expert is reused soon
+  expected saved refetch if admitted to GPU
+  token/LM-head next-token prior
+  request-pool reuse
+  SpecMD-LS staleness
+```
+
+核心 utility:
+
+```text
+cost_cpu(e) =
+    D2H(h) + CPU_GEMV(e, h) + H2D(partial) + sync
+
+cost_fetch_gpu(e) =
+    H2D(weights_e) + GPU_compute(e)
+    + cache_opportunity_cost(e)
+    - expected_future_refetch_saved(e)
+
+cost_drop(e) =
+    quality_penalty(e) * slo_price
+```
+
+动作:
+
+```text
+choose min(cost_cpu, cost_fetch_gpu, cost_drop/low_precision)
+```
+
+这就把 miss-handling 和 eviction 连接起来了:
+
+```text
+如果未来复用概率低 -> CPU compute once, 不污染 cache
+如果未来复用概率高 -> fetch to GPU and admit/cache
+如果重要度低且 SLO 紧 -> drop/low precision
+```
+
+### 2.8.4 和 Fiddler / HybriMoE 的关系
+
+这条机制本身**不新**。
+
+Fiddler 已经明确提出:
+
+```text
+when expert weights are missing on GPU:
+  option B: copy weights to GPU and execute
+  option C: copy activations to CPU, execute on CPU, copy outputs back
+```
+
+Fiddler 的关键判断是:
+
+```text
+CPU path 对小 input size 有利;
+GPU weight-transfer path 对大 batch/input size 有利。
+```
+
+HybriMoE 也在 hybrid CPU-GPU scheduling/cache management 方向, 包括动态 intra-layer scheduling、prefetch/cache 策略。
+
+所以不能把 novelty 写成:
+
+```text
+we propose CPU computation for missed experts
+```
+
+这会撞 Fiddler。
+
+SPICE 可能的差异必须写成:
+
+```text
+Fiddler decides CPU vs GPU mainly from input size and placement latency.
+SPICE placement decides CPU vs GPU vs cache admission vs SLO drop using
+verified routing, draft/token future-reuse signals, and cache/DMA state.
+```
+
+也就是:
+
+```text
+not CPU compute itself,
+but information-driven miss placement and cache admission.
+```
+
+### 2.8.5 什么时候 CPU compute 应该赢
+
+CPU compute 适合:
+
+```text
+batch=1 / small per-expert token count
+low PCIe bandwidth
+large expert weights
+low future reuse probability
+high GPU cache pressure
+miss is likely one-shot
+```
+
+GPU fetch/cache 适合:
+
+```text
+expert likely reused soon
+many tokens route to same expert
+CPU queue saturated
+cache has low-value victim
+PCIe bandwidth high enough
+```
+
+drop/low precision 适合:
+
+```text
+low gate/contribution value
+strict latency SLO
+quality budget available
+```
+
+### 2.8.6 风险
+
+1. **0.2ms 需要实测。**
+
+   理论 DRAM 带宽下界不等于真实 CPU kernel latency。需要 packed weights、NUMA pinning、AVX512/BF16 或高效 GEMV kernel、线程池、pinned transfer buffers。Python/torch per-expert 调用会把收益吃掉。
+
+2. **小传输不是零开销。**
+
+   8KB bandwidth 成本很小, 但 D2H/H2D roundtrip、同步、CPU dispatch 可能几十微秒到更高。
+
+3. **"精确无损"要小心。**
+
+   CPU BF16/FP32 accumulation 和 GPU BF16 GEMM 可能不 bit-identical。更诚实的说法是:
+
+   ```text
+   same expert, same weights, no algorithmic approximation;
+   numerical difference must be measured.
+   ```
+
+   如果 SPICE exact mode 要求 `max_logit_diff=0`, CPU path 可能只能称为 numerically equivalent within tolerance。
+
+4. **CPU 可能成为新瓶颈。**
+
+   Qwen 每 token 最多 `24 layers * top4 = 96` routed expert calls。如果都走 CPU, 即使 0.2ms/expert 串行也是 19ms/token。必须按 layer 并行多个 experts, 并和 GPU hits/shared compute overlap。
+
+5. **已有工作 baseline 很强。**
+
+   Fiddler/HybriMoE/KTransformers 类系统必须作为 baseline 或至少清楚说明边界。
+
+### 2.8.7 最小验证实验
+
+先做 microbenchmark, 不要先接完整 runtime:
+
+```text
+Measure:
+  T_cpu_exact(m experts in one layer)
+  T_d2h_hidden + T_h2d_partial
+  T_fetch_weight_to_gpu + T_gpu_expert
+  CPU/GPU parallel partial-sum path
+
+Sweep:
+  m = 1,2,4,8 CPU experts per layer
+  Qwen and DeepSeek expert shapes
+  CPU threads / NUMA / precision
+  bw = 5/12/24GB/s equivalent if simulating transfer
+```
+
+Go/no-go:
+
+```text
+T_cpu_layer(m_miss) <= 0.5 * T_fetch_layer(m_miss)
+for realistic m_miss,
+and numerical diff is acceptable.
+```
+
+然后做 placement replay:
+
+```text
+policies:
+  SPICE fetch-all
+  Fiddler-style input-size threshold
+  CPU-always-on-miss
+  SPICE-informed placement:
+      CPU if one-shot / low reuse
+      GPU fetch/cache if high future reuse
+      drop/low precision if low SLO value
+
+metrics:
+  TPOT
+  exposed stall
+  CPU busy time
+  H2D bytes
+  cache pollution
+  PPL / numerical diff
+```
+
+### 2.8.8 判断
+
+这是**非常强的工程候选**, 甚至可能比继续挖 gate/drop/eviction policy 更有实际收益。
+
+但它不是干净的新 primitive。单独说 "miss 时 CPU 算 expert" 会被 Fiddler 覆盖。
+
+更好的 SPICE 版本是:
+
+```text
+SPICE-Placement:
+verified expert movement with execution placement.
+
+On a miss, SPICE decides whether to:
+  CPU-compute once,
+  GPU-fetch-and-cache,
+  or degrade under an SLO,
+using future-reuse and quality information.
+```
+
+如果能证明 SPICE-informed placement 超过 Fiddler-style input-size threshold 和 HybriMoE-style hybrid scheduling, 这可以成为很强的 revision contribution。
+
 ## 3. 信息源深分析
 
 下面按信息源逐一分析。
@@ -1656,3 +1980,477 @@ token/LM-head conditioned cross-token expert movement
 ```
 
 因为它最明确地补 SPICE draft 的结构性短板。
+
+## 9. 2026-06-03 基于 SPICE PDF 的收束判断
+
+### 9.1 SPICE 原文到底留下了什么洞
+
+读完 `SPICE.pdf` 后, 原文的真实边界可以更精确地写成:
+
+```text
+SPICE = within-token, cross-layer, verified expert prefetch.
+```
+
+它做得很清楚:
+
+```text
+draft predicts future-layer experts
+asynchronous H2D prefetch fills GPU expert cache
+target router verifies actual top-k
+missing selected expert -> synchronous fallback fetch
+```
+
+但它没有解决三个资源决策:
+
+```text
+1. finite cache 下, 哪些 prefetched/resident experts 值得保留?
+2. miss 出现后, 是否必须无条件 fetch exact?
+3. H2D budget 紧张时, speculative traffic 和 demand traffic 如何分配?
+```
+
+这不是外加问题。SPICE 自己的实验已经暴露边界:
+
+```text
+Table I: SPICE H2D 198.80GB, LRU 57.44GB
+Table VI: 128 cache slots 下 SPICE 62.07ms 输给 LRU 58.95ms
+Table III: Top-K 增大后 fallback 和 PCIe active 很快饱和
+```
+
+所以 revision 的切入口应该是:
+
+```text
+SPICE predicts what may be useful.
+New work decides what is worth serving under cache/bandwidth/quality constraints.
+```
+
+而不是:
+
+```text
+we prefetch better.
+```
+
+### 9.2 batch 设定
+
+SPICE 原文没有把 multi-request batch serving 作为问题设定。唯一明确的 `batch size 8` 是 draft model training, 不是 inference serving。
+
+原文 inference 叙事是:
+
+```text
+per-token TPOT/TTFT
+per-layer expert movement
+single MoE layer timeline
+router mismatch -> synchronous fallback
+replayed decoding steps
+```
+
+因此可以说:
+
+```text
+SPICE is written as implicit single-stream decode.
+It does not model concurrent request scheduling, queueing delay, or expert sharing across requests.
+```
+
+这决定了后续方向:
+
+```text
+batch=1 / single-stream:
+  miss-handling and cache/bandwidth admission 是自然补强.
+
+batch>1 / serving:
+  cross-request multiplexing 是另一个论文 scope, 不是 SPICE 小修.
+```
+
+### 9.3 相关工作压力比之前更大
+
+2026 年的新工作让 "utility cache policy" 这条路更拥挤:
+
+```text
+SpecMD: standardized cache-policy benchmark + Least-Stale eviction.
+MoE-SpAc: speculative activation utility, workload balancer, unified prefetch+eviction utility.
+ActiveEvict: proactive eviction + budget-aware routing.
+FluxMoE: decouples expert residency, streams experts transiently to prioritize KV/runtime state.
+Alloc-MoE: activation budget allocation across layer/token.
+```
+
+再加上已有的:
+
+```text
+Fiddler: CPU/GPU execution placement for MoE experts.
+HybriMoE: hybrid CPU-GPU scheduling + cache management.
+HOBBIT: low-precision cache-miss experts.
+FineMoE: fine-grained expert patterns + semantic hints for prefetch/caching/offloading.
+```
+
+这意味着以下 claim 都很危险:
+
+```text
+"we propose eviction utility"              -> MoE-SpAc / SpecMD / ActiveEvict
+"we compute missed experts on CPU"         -> Fiddler / HybriMoE
+"we approximate low-value miss experts"    -> HOBBIT / Alloc-MoE / AdapMoE
+"we use semantic/context routing patterns" -> FineMoE
+"we unify prefetch and eviction"           -> MoE-SpAc
+```
+
+要保持 SPICE 主线, 新 claim 必须更窄也更硬:
+
+```text
+SPICE exposes verified routing information before commitment.
+We study which verified or target-derived signals are actionable for
+miss service and cache admission under exact/SLO modes.
+```
+
+### 9.4 三个真正不同的故事
+
+#### Story A: Verified miss admission for exact/SLO dual-mode SPICE
+
+核心:
+
+```text
+SPICE exact mode: fetch every verified miss.
+SLO mode: admit/drop/approximate each verified miss by quality-vs-stall utility.
+```
+
+最强证据:
+
+```text
+Qwen 10% cache, bw12:
+drop 27% low-importance miss -> stall -33%, PPL +1.8%
+drop 58% -> stall -70%, PPL +10%
+```
+
+优点:
+
+```text
+和 SPICE 原文关系最紧.
+数据已经有 verified on-policy Pareto.
+不需要声称新的 predictor.
+```
+
+致命弱点:
+
+```text
+drop/low-precision miss handling 已经接近 HOBBIT/AdapMoE/Alloc-MoE.
+gate/rank/mass policy 轴已验证不稳定支配, 不能当非增量 novelty.
+```
+
+适合定位:
+
+```text
+practical revision contribution / SLO mode,
+not standalone non-incremental mechanism.
+```
+
+#### Story B: SPICE-informed miss placement
+
+核心:
+
+```text
+On a verified miss:
+  CPU-compute once if reuse value is low;
+  GPU-fetch-and-cache if future reuse value is high;
+  drop/low precision if SLO value is low.
+```
+
+数据流:
+
+```text
+router verifies selected experts
+cache lookup reveals miss
+runtime estimates:
+  CPU compute cost
+  GPU fetch/cache cost
+  future reuse value
+  SLO quality value
+choose execution placement and cache admission
+```
+
+优点:
+
+```text
+实际系统收益可能最大.
+把 miss-handling 和 eviction 统一成 "serve once vs cache for reuse".
+自然解释为什么信息有用: information changes placement action.
+```
+
+致命弱点:
+
+```text
+CPU compute itself不是新机制, Fiddler/HybriMoE 已经覆盖.
+必须证明 SPICE-informed utility 超过 Fiddler-style input-size/hardware threshold.
+```
+
+最小 kill test:
+
+```text
+microbenchmark Qwen/DeepSeek:
+  T_cpu_layer(m misses) + activation roundtrip
+  vs T_fetch_weights(m misses) + GPU compute
+
+go if:
+  CPU placement reduces exposed miss latency by >=2x
+  and SPICE-informed placement beats CPU-always/Fiddler-threshold by >=15-20%.
+```
+
+适合定位:
+
+```text
+strong engineering extension if measured wins are large.
+Incremental risk high unless baseline comparison is clean.
+```
+
+#### Story C: Cross-token expert movement from target LM-head/token prior
+
+核心:
+
+```text
+SPICE draft predicts current token's future layers.
+It does not predict which same-layer experts future tokens will reuse.
+
+Use target LM-head / actual next-token id / token-conditioned expert prior
+to estimate future-token expert demand, then drive cache protection/admission.
+```
+
+为什么这是最可能的非增量点:
+
+```text
+It attacks an information/action mismatch in SPICE:
+  SPICE information = within-token future-layer
+  eviction need = future-token same-layer reuse
+```
+
+动作不是普通 prefetch:
+
+```text
+protect resident experts likely useful for next token
+avoid admitting one-shot misses into GPU cache
+reserve cache for predicted cross-token reuse
+```
+
+致命弱点:
+
+```text
+FineMoE/SpecMD/MoE-SpAc 已经覆盖部分 pattern/utility/cache 空间.
+token prior recall 高不等于 utility 高.
+当前 token_table_replay 还有正确性 bug, 不能直接用结论.
+```
+
+最小 kill test:
+
+```text
+fix token_table_replay correctness first:
+  demand-priority DMA queue
+  per-sequence oracle
+  train-static LFU
+  correct LRU
+  no cross-sequence oracle leakage
+
+then compare:
+  LRU / SpecMD-LS / train-LFU / token-table / LM-head top-M / oracle
+
+go if:
+  token/LM-head policy beats best(SpecMD-LS, LFU) by >=10-15% exposed stall
+  and closes >=25% of LS->oracle gap
+  without H2D byte explosion
+  on Qwen and DeepSeek.
+```
+
+适合定位:
+
+```text
+best non-incremental candidate if utility passes.
+It gives a real new information-action coupling on top of SPICE.
+```
+
+### 9.5 我的推荐
+
+当前不要押 Story A 单独成主线。它是有用的, 但已有工作太近, 且 policy superiority 已经被实验削弱。
+
+当前也不要先押 Story B。它可能很实用, 但 Fiddler/HybriMoE 压力很大, 需要系统实现和 baseline 工作量。
+
+最应该先做的是 Story C 的 kill test:
+
+```text
+fix token_table_replay -> run token/LM-head cross-token utility.
+```
+
+原因:
+
+```text
+1. 它最直接补 SPICE 的结构性缺口.
+2. 它不是 "more prefetch", 而是 cross-token cache/admission.
+3. 它能回答用户最关心的问题: 有效信息如何真正被踢出来并用于动作.
+4. 如果失败, 失败本身也支持 characterization story:
+   apparent routing information does not survive the utility gate.
+```
+
+最终论文可以有两个层次:
+
+```text
+Main contribution if Story C passes:
+  SPICE-X: cross-token target-derived expert movement for cache admission.
+
+Support contribution:
+  verified SLO miss admission Pareto.
+
+Characterization:
+  why within-token draft eviction, miss-shadow, and bandit depth fail.
+```
+
+如果 Story C 失败:
+
+```text
+Do not force novelty.
+Write the paper as a rigorous SPICE characterization + exact/SLO resource scheduler,
+or pivot to SPICE-informed placement with Fiddler/HybriMoE baselines.
+```
+
+### 9.6 最短行动计划
+
+```text
+Day 1:
+  fix token_table_replay correctness.
+
+Day 2:
+  run Qwen:
+    LRU / SpecMD-LS / train-LFU / token-known / LM-head top-M / oracle.
+
+Day 3:
+  run DeepSeek same table.
+
+Decision:
+  if token/LM-head wins -> build SPICE-X story.
+  if not -> run CPU miss-placement microbench.
+  if both fail -> write characterization + SLO miss-admission revision.
+```
+
+### 9.7 SPICE-REC corrected gate: CPU miss service as recovery window
+
+SPICE-REC 的更准确表述不是:
+
+```text
+miss becomes zero PCIe.
+```
+
+而是:
+
+```text
+miss no longer consumes weight-scale demand H2D.
+CPU exact service frees a bounded PCIe window that may be used for downstream verified prefetch.
+```
+
+CPU 服务仍然有 KB 级 activation D2H / output H2D, 且有两个必须建模的 contention:
+
+```text
+1. CPU output H2D must preempt or bypass low-priority prefetch.
+   If the tiny output sits behind a non-preemptible 17MB prefetch, REC loses.
+
+2. CPU expert compute and PCIe DMA both read host DRAM.
+   If CPU GEMV is memory-bound, the "free PCIe window" is not actually free.
+```
+
+因此 runtime 必须是:
+
+```text
+high-priority D2H activation
+CPU exact missed expert compute
+low-priority chunked downstream prefetch into shadow/protected buffers
+high-priority H2D CPU partial output
+resume exact target
+```
+
+关键不是 issued prefetch bytes, 而是:
+
+```text
+timely_useful_prefetch_bytes
+```
+
+定义:
+
+```text
+timely_useful_prefetch_bytes =
+  bytes of REC-issued experts that
+    (a) are actually selected by later target routers,
+    (b) arrive before their demand deadline,
+    (c) would otherwise have caused exposed miss stall,
+    (d) are not evicted/polluting main cache before use.
+```
+
+窗口效率:
+
+```text
+eta_rec =
+  timely_useful_prefetch_bytes
+  / (B_pcie_under_cpu_compute * T_cpu_service_window)
+```
+
+其中 `B_pcie_under_cpu_compute` 必须用并发 CPU expert compute 时测得的 PCIe 带宽, 不能用 standalone copy bandwidth。
+
+#### Corrected kill test
+
+最小对比组:
+
+```text
+1. SPICE_fetch_fallback
+   miss -> demand H2D weight -> GPU compute.
+
+2. CPU_only_Fiddler
+   miss -> CPU exact service, no recovery prefetch.
+
+3. SPICE_REC
+   CPU exact service + chunked low-priority downstream shadow prefetch.
+
+4. random_REC
+   same REC byte budget, random future experts.
+
+5. dummy_prefetch
+   same bytes copied to unused buffers, isolates contention overhead.
+
+6. oracle_shadow_no_pollution
+   oracle future experts, protected shadow buffer, no main-cache pollution.
+
+7. spice_rec_no_evict
+   REC prefetch only into free/protected shadow slots, no eviction of main cache.
+```
+
+Go:
+
+```text
+SPICE_REC vs CPU_only_Fiddler:
+  exposed stall improves >=15-20%
+  wall-clock improves >=8-10%
+
+eta_rec is non-trivial:
+  timely_useful_prefetch_bytes / theoretical_window_bytes >= ~20-30%
+
+oracle_shadow_no_pollution upper bound is large:
+  otherwise REC has no headroom.
+```
+
+No-go:
+
+```text
+eta_rec < ~15-20%,
+or oracle_shadow_no_pollution barely beats CPU_only,
+or dummy_prefetch slowdown cancels the useful prefetch gain,
+or CPU output H2D is delayed by low-priority prefetch chunks.
+```
+
+#### Defensible novelty boundary
+
+This is not:
+
+```text
+we combine CPU execution and prefetch.
+```
+
+That is too close to Fiddler / HybriMoE / MoE-SpAc.
+
+The defensible claim, only if the kill test passes, is:
+
+```text
+SPICE-REC uses exact CPU miss service as an active bandwidth-decoupling primitive:
+the exposed CPU service latency is converted into timely verified downstream expert movement,
+under chunked/preemptible DMA and shadow-cache protection.
+```
+
+If `SPICE_REC` cannot beat `CPU_only_Fiddler`, the idea collapses to Fiddler plus incidental prefetch and should not be a main contribution.

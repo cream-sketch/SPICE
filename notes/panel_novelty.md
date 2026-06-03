@@ -1,0 +1,12 @@
+PEER REVIEW (be a harsh top-tier systems/ML reviewer). Rule on NOVELTY only.
+
+Proposal "SPICE-X: verified selective residency / future-value-aware expert admission" for offloaded MoE inference (single GPU, batch=1 decode, fine-grained MoE Qwen1.5-MoE 60-expert top4 / DeepSeek-V2-Lite). Core thesis: use != residency. An expert being used by the current token does NOT mean it should be admitted to GPU cache. Decouple two decisions SPICE currently couples: (1) SERVE current token (must compute this expert), (2) GRANT GPU residency (keep in cache betting on future reuse). 
+Mechanism: on a (predicted or missed) expert, decide among {fetch-weight-to-GPU-and-CACHE if future reuse R_e high; CPU-compute-ONCE transient-service (no cache pollution) if R_e low; drop/low-precision if gate low under SLO}. Admit-to-cache rule: R_e*(C_cpu - C_gpu) > C_fetch + V_victim. R_e predicted by SPICE within-token draft (current token future layers) + LM-head/token transition prior (future tokens same layer) + verified gate (importance).
+Measured on real A800: C_cpu=0.18ms, C_gpu=0.079ms, C_fetch=0.78ms => break-even R_e ~ 8 reuses; access is near-uniform/memoryless (Gini 0.17) so MOST used experts never reach 8 => most should be CPU-served-once, NOT cached. Counterintuitive claim: SPICE-default "cache every fetched expert" systematically over-admits.
+
+QUESTION: is this novel, or subsumed? Address each:
+- Classic cache ADMISSION (TinyLFU/W-TinyLFU "admit on frequency", 2Q, ARC, LIRS): selective admission to avoid one-hit-wonder pollution is decades old. Is "predict reuse, admit only if high" just TinyLFU with a learned frequency estimator?
+- The NEW part claimed: CPU-compute as the "transient service" alternative to admission (Fiddler gives CPU-compute but uses it for CPU/GPU load-balancing, NOT as an admission filter). Is "serve-once-on-CPU instead of caching" a genuinely new use of Fiddler's mechanism, or trivial?
+- FineMoE/fMoE (gate-prob cache priority), HybriMoE (dynamic CPU/GPU sched + prefetch + caching), SpecMD (Least-Stale eviction), AdapMoE, MoE-Infinity: do any already do "admit-to-cache only if predicted-reuse clears a compute-vs-fetch break-even, else CPU-serve"?
+- Is the verified-gate + draft + token-prior R_e predictor a real novelty or decoration?
+VERDICT: defensible-paper-contribution / appendix-only / dead (already exists). Name the single closest prior work and the one thing SPICE-X must show to beat it.

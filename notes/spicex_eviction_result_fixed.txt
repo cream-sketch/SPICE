@@ -1,0 +1,22 @@
+   76eec03..72b24da  exp/nonincremental-miss-recovery -> exp/nonincremental-miss-recovery
+[data] seqs train=24 test=16 layers=24 experts=60 A_entries=14520 test_tokens=2048
+res= 0.05 cap=  72            lru hit=0.0000
+res= 0.05 cap=  72      specmd_ls hit=0.0666
+res= 0.05 cap=  72   value_within hit=0.0801
+res= 0.05 cap=  72          value hit=0.1193
+res= 0.05 cap=  72  oracle_belady hit=0.3148
+res=  0.1 cap= 144            lru hit=0.1528
+res=  0.1 cap= 144      specmd_ls hit=0.1573
+res=  0.1 cap= 144   value_within hit=0.1638
+res=  0.1 cap= 144          value hit=0.1896
+res=  0.1 cap= 144  oracle_belady hit=0.4537
+res=  0.2 cap= 288            lru hit=0.3392
+res=  0.2 cap= 288      specmd_ls hit=0.3348
+res=  0.2 cap= 288   value_within hit=0.3232
+res=  0.2 cap= 288          value hit=0.3138
+res=  0.2 cap= 288  oracle_belady hit=0.6204
+
+===== VALUE vs LS verdict =====
+res=0.05: LS=0.0666 VALUE=0.1193 Belady=0.3148 | value-LS=+0.0527 share_of_headroom=+21.23% GO
+res=0.1: LS=0.1573 VALUE=0.1896 Belady=0.4537 | value-LS=+0.0323 share_of_headroom=+10.90% GO
+res=0.2: LS=0.3348 VALUE=0.3138 Belady=0.6204 | value-LS=-0.0210 share_of_headroom=-7.34% NO-GO(~=LS)
