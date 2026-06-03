@@ -1,0 +1,43 @@
+{
+  "d_model": 2048,
+  "inter": 1408,
+  "bytes_per_expert_MB": 17.301504,
+  "threads": 52,
+  "rows": [
+    {
+      "batch": 1,
+      "cpu_ms_per_expert": 0.3172737609475007,
+      "fetch_ms@5gbps": 3.22265625,
+      "fetch_ms@12gbps": 1.3427734375,
+      "fetch_ms@24gbps": 0.67138671875
+    },
+    {
+      "batch": 4,
+      "cpu_ms_per_expert": 0.33307403441540373,
+      "fetch_ms@5gbps": 3.22265625,
+      "fetch_ms@12gbps": 1.3427734375,
+      "fetch_ms@24gbps": 0.67138671875
+    },
+    {
+      "batch": 8,
+      "cpu_ms_per_expert": 0.4057620078128821,
+      "fetch_ms@5gbps": 3.22265625,
+      "fetch_ms@12gbps": 1.3427734375,
+      "fetch_ms@24gbps": 0.67138671875
+    },
+    {
+      "batch": 16,
+      "cpu_ms_per_expert": 0.715878851542584,
+      "fetch_ms@5gbps": 3.22265625,
+      "fetch_ms@12gbps": 1.3427734375,
+      "fetch_ms@24gbps": 0.67138671875
+    },
+    {
+      "batch": 32,
+      "cpu_ms_per_expert": 0.8051861265812477,
+      "fetch_ms@5gbps": 3.22265625,
+      "fetch_ms@12gbps": 1.3427734375,
+      "fetch_ms@24gbps": 0.67138671875
+    }
+  ]
+}
