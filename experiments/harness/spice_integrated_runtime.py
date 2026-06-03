@@ -46,6 +46,10 @@ def parse_args():
                     help="fraction of routed slots that miss after prefetch (paper 0.2576)")
     ap.add_argument("--fetch_frac", type=float, required=True,
                     help="capacity policy: fraction of residual misses sent to PCIe fetch (rest to CPU)")
+    ap.add_argument("--substitute_ranks", type=str, required=True,
+                    help="controller policy: comma list of top-k RANKS (0=highest gate weight) whose residual "
+                         "misses are SHARED-EXPERT-SUBSTITUTED (free, lossy); other residuals CPU-served (exact). "
+                         "Empty string = no substitution (all CPU-serve = exact).")
     ap.add_argument("--trace_dir", required=True, help="real decode traces dir, or 'synthetic'")
     ap.add_argument("--out", required=True)
     ap.add_argument("--cpu_dtype", choices=["bf16", "fp32"], default="bf16")
@@ -61,6 +65,8 @@ def main():
     cpu_dt = torch.bfloat16 if a.cpu_dtype == "bf16" else torch.float32
     dm, di, H = a.d_model, a.d_inter, a.n_heads; hd = dm // H
     L, E = a.n_layers, a.n_experts
+    # controller: which top-k ranks (0=highest gate weight) to shared-expert-substitute when residual-missed
+    substitute_ranks = set(int(x) for x in a.substitute_ranks.split(",") if x.strip() != "")
 
     Wq = [torch.randn(dm, dm, device=dev, dtype=dt) for _ in range(L)]
     Wk = [torch.randn(dm, dm, device=dev, dtype=dt) for _ in range(L)]
@@ -121,59 +127,59 @@ def main():
             routes = (routes * (a.decode_tokens // max(1, len(routes)) + 1))[:a.decode_tokens]
     T = len(routes)
 
-    # ---- PRE-GENERATE shared hit/residual mask (identical across policies) ----
-    # is_residual[ti][l] = list of residual-missed experts; hit_count[ti][l] = #hits (resident or prefetched).
-    # Each routed slot is a residual miss with prob target_residual_rate (deterministic seed); rest are hits.
-    is_residual = [[[] for _ in range(L)] for _ in range(T)]
-    hit_count = [[0 for _ in range(L)] for _ in range(T)]
-    prefetch_experts = [[[] for _ in range(L)] for _ in range(T)]  # the hit slots SPICE prefetched (H2D traffic)
+    # ---- PRE-GENERATE shared per-slot mask (identical across policies) ----
+    # slot_info[ti][l] = list of (expert, rank, is_residual). rank = index in the token-layer top-k
+    # (descending gate weight, 0=highest). is_residual: prefetch missed this slot (prob target_residual_rate);
+    # else it is a prefetch/resident HIT. The controller may SUBSTITUTE low-rank slots (skip prefetch+serve).
+    slot_info = [[[] for _ in range(L)] for _ in range(T)]
     for ti in range(T):
         for l in range(L):
-            for e in routes[ti][l]:
-                if rng.random() < a.target_residual_rate:
-                    is_residual[ti][l].append(e)
-                else:
-                    hit_count[ti][l] += 1
-                    prefetch_experts[ti][l].append(e)  # served from HBM via prefetch; counts as prefetch H2D
+            for rank, e in enumerate(routes[ti][l]):  # routes top-k ordered by gate weight (rank 0 = highest)
+                is_resid = rng.random() < a.target_residual_rate
+                slot_info[ti][l].append((e, rank, is_resid))
 
-    def serve_residual(policy, misses, l, hn_gpu):
-        # returns the residual contribution tensor on GPU; REAL fetch/cpu service. hn_gpu: (1, dm) on GPU.
+    def serve_residual(policy, misses, l, hn_gpu, sub_stats):
+        # misses: list of (expert, rank). Returns residual contribution tensor on GPU; REAL fetch/cpu service.
+        # sub_stats: [substituted, cpu_served, fetched] counters (mutated). hn_gpu: (1, dm) on GPU.
         if not misses:
             return None
         if policy == "prefetch_sync":
             acc = None
-            for e in misses:  # synchronous per-expert: H2D -> wait -> GEMM (SPICE original fallback)
+            for e, _r in misses:  # synchronous per-expert: H2D -> wait -> GEMM (SPICE original fallback)
                 with torch.cuda.stream(fetch_stream):
                     for s, dd in zip(host_bank[hkey(l, e)], fetch_stage[0]):
                         dd.copy_(s, non_blocking=True)
                 torch.cuda.current_stream(dev).wait_stream(fetch_stream)
                 oe = expert_gpu(fetch_stage[0], hn_gpu)
                 acc = oe if acc is None else acc + oe
+                sub_stats[3] += 1
             return acc
         if policy == "prefetch_cpu":
             hc = hn_gpu.to(dtype=cpu_dt).cpu()  # ONE D2H per layer (codex fix)
             acc = None
-            for e in misses:
+            for e, _r in misses:
                 oc = expert_cpu(hc, l, e)
                 acc = oc if acc is None else acc + oc
+                sub_stats[2] += 1
             return acc.to(dev, dtype=dt)
         # prefetch_capacity: split fetch (PCIe) || cpu (DRAM), concurrent.
         # fetch_frac=0 -> all CPU; fetch_frac=1 -> all fetch. round() allows exact 0 (no forced fetch).
         n = len(misses); nf = int(round(a.fetch_frac * n))
         fetch_set = misses[:nf]; cpu_set = misses[nf:]
         fetch_outs = []
-        for i, e in enumerate(fetch_set):  # launch async H2D (concurrent with CPU below)
+        for i, (e, _r) in enumerate(fetch_set):  # launch async H2D (concurrent with CPU below)
             slot = fetch_stage[i % len(fetch_stage)]
             with torch.cuda.stream(fetch_stream):
                 for s, dd in zip(host_bank[hkey(l, e)], slot):
                     dd.copy_(s, non_blocking=True)
-            fetch_outs.append((slot, e))
+            fetch_outs.append((slot, e)); sub_stats[3] += 1
         acc = None
         if cpu_set:
             hc = hn_gpu.to(dtype=cpu_dt).cpu()  # ONE D2H
-            for e in cpu_set:
+            for e, _r in cpu_set:
                 oc = expert_cpu(hc, l, e)
                 acc = oc if acc is None else acc + oc
+                sub_stats[2] += 1
             acc = acc.to(dev, dtype=dt)
         if fetch_outs:
             torch.cuda.current_stream(dev).wait_stream(fetch_stream)
@@ -183,6 +189,11 @@ def main():
         return acc
 
     def run_decode(policy):
+        sub_stats = [0, 0, 0, 0]  # [substituted_hit, substituted_residual, cpu_served, fetched]
+        # controller substitutes low-gate-mass (high-rank) slots: skip BOTH prefetch H2D AND serve,
+        # relying on the always-on shared expert. This removes their PCIe traffic -> lowers the floor.
+        do_sub = (policy == "prefetch_controller")
+        serve_policy = "prefetch_cpu" if policy == "prefetch_controller" else policy
         torch.cuda.synchronize(dev)
         t0 = time.perf_counter()
         for ti in range(T):
@@ -192,39 +203,52 @@ def main():
                 hn = h
                 _ = F.linear(hn, Wrt[l])
                 out = shared(l, hn)
-                # hits (resident or prefetched): GPU GEMM each (real cost; prefetch already brought them)
-                for _ in range(hit_count[ti][l]):
-                    out = out + expert_gpu(resident_w, hn)
-                # SPICE prefetch H2D traffic for the hit slots (real, overlapped on low-pri stream;
-                # contends PCIe with the capacity fallback's fetch -- a real effect). Identical across policies.
-                for e in prefetch_experts[ti][l]:
-                    with torch.cuda.stream(pf_stream):
-                        for s, dd in zip(host_bank[hkey(l, e)], pf_stage):
-                            dd.copy_(s, non_blocking=True)
-                # residual misses: the VARIED fallback
-                r = serve_residual(policy, is_residual[ti][l], l, hn)
+                residual = []
+                for e, rank, is_resid in slot_info[ti][l]:
+                    if do_sub and rank in substitute_ranks:
+                        # substituted: no prefetch, no serve (shared covers it). Split hit vs residual:
+                        # substituted HIT saves a prefetch H2D (PCIe, the bottleneck); residual saves CPU serve.
+                        sub_stats[1 if is_resid else 0] += 1
+                        continue
+                    if is_resid:
+                        residual.append((e, rank))
+                    else:
+                        # hit: GPU GEMM + SPICE prefetch H2D traffic (overlapped on low-pri stream)
+                        out = out + expert_gpu(resident_w, hn)
+                        with torch.cuda.stream(pf_stream):
+                            for s, dd in zip(host_bank[hkey(l, e)], pf_stage):
+                                dd.copy_(s, non_blocking=True)
+                r = serve_residual(serve_policy, residual, l, hn, sub_stats)
                 if r is not None:
                     out = out + r
                 h = h + out
         torch.cuda.synchronize(dev)
-        return (time.perf_counter() - t0) / T * 1000.0
+        ms = (time.perf_counter() - t0) / T * 1000.0
+        return ms, sub_stats
 
-    residual_per_tok = sum(len(is_residual[ti][l]) for ti in range(T) for l in range(L)) / T
-    hits_per_tok = sum(hit_count[ti][l] for ti in range(T) for l in range(L)) / T
+    residual_per_tok = sum(1 for ti in range(T) for l in range(L) for (_e, _r, ir) in slot_info[ti][l] if ir) / T
+    hits_per_tok = sum(1 for ti in range(T) for l in range(L) for (_e, _r, ir) in slot_info[ti][l] if not ir) / T
     res = {"config": vars(a), "T": T, "residual_miss_per_tok": residual_per_tok, "hits_per_tok": hits_per_tok,
-           "effective_residual_rate": residual_per_tok / max(1e-9, residual_per_tok + hits_per_tok)}
-    for pol in ["prefetch_sync", "prefetch_cpu", "prefetch_capacity"]:
+           "effective_residual_rate": residual_per_tok / max(1e-9, residual_per_tok + hits_per_tok),
+           "substitute_ranks": sorted(substitute_ranks)}
+    import statistics
+    for pol in ["prefetch_sync", "prefetch_cpu", "prefetch_capacity", "prefetch_controller"]:
         run_decode(pol)  # per-policy warmup
-        ms = run_decode(pol)
+        runs = [run_decode(pol) for _ in range(5)]  # 5 timed runs, take median (reduce single-run noise)
+        ms = statistics.median([r[0] for r in runs]); st = runs[-1][1]
         res[f"tpot_{pol}_ms"] = ms
-        print(f"[{pol:>18}] TPOT={ms:8.3f} ms/token", flush=True)
+        res[f"stats_{pol}"] = {"substituted_hit_per_tok": st[0] / T, "substituted_residual_per_tok": st[1] / T,
+                               "cpu_served_per_tok": st[2] / T, "fetched_per_tok": st[3] / T}
+        print(f"[{pol:>20}] TPOT={ms:8.3f} ms/token  subst_hit/tok={st[0]/T:5.2f} subst_resid/tok={st[1]/T:5.2f} "
+              f"cpu/tok={st[2]/T:5.2f} fetch/tok={st[3]/T:5.2f}", flush=True)
     base = res["tpot_prefetch_sync_ms"]
-    res["capacity_vs_sync_pct"] = 100 * (base - res["tpot_prefetch_capacity_ms"]) / base
     res["cpu_vs_sync_pct"] = 100 * (base - res["tpot_prefetch_cpu_ms"]) / base
-    res["capacity_vs_cpu_pct"] = 100 * (res["tpot_prefetch_cpu_ms"] - res["tpot_prefetch_capacity_ms"]) / res["tpot_prefetch_cpu_ms"]
-    print(f"\n[REAL] residual_miss/tok={residual_per_tok:.2f} (rate={res['effective_residual_rate']:.3f}) | "
-          f"capacity vs SPICE-sync={res['capacity_vs_sync_pct']:+.1f}%  cpu vs sync={res['cpu_vs_sync_pct']:+.1f}%  "
-          f"capacity vs cpu={res['capacity_vs_cpu_pct']:+.1f}%", flush=True)
+    res["capacity_vs_sync_pct"] = 100 * (base - res["tpot_prefetch_capacity_ms"]) / base
+    res["controller_vs_sync_pct"] = 100 * (base - res["tpot_prefetch_controller_ms"]) / base
+    res["controller_vs_cpu_pct"] = 100 * (res["tpot_prefetch_cpu_ms"] - res["tpot_prefetch_controller_ms"]) / res["tpot_prefetch_cpu_ms"]
+    print(f"\n[REAL] residual_miss/tok={residual_per_tok:.2f} (rate={res['effective_residual_rate']:.3f}) "
+          f"substitute_ranks={sorted(substitute_ranks)} | cpu vs sync={res['cpu_vs_sync_pct']:+.1f}%  "
+          f"controller vs sync={res['controller_vs_sync_pct']:+.1f}%  controller vs cpu(exact)={res['controller_vs_cpu_pct']:+.1f}%", flush=True)
     Path(a.out).write_text(json.dumps(res, indent=2))
 
 
