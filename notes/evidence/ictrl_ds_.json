@@ -1,0 +1,58 @@
+{
+  "config": {
+    "gpu": 0,
+    "n_layers": 26,
+    "d_model": 2048,
+    "d_inter": 1408,
+    "n_experts": 64,
+    "top_k": 6,
+    "n_heads": 16,
+    "ctx_len": 512,
+    "decode_tokens": 40,
+    "cpu_threads": 16,
+    "target_residual_rate": 0.2576,
+    "fetch_frac": 0.33,
+    "substitute_ranks": "",
+    "trace_dir": "/home/ziheng/workspace/spice_runs/ds_decode_big",
+    "out": "../../notes/evidence/ictrl_ds_.json",
+    "cpu_dtype": "bf16",
+    "seed": 0
+  },
+  "T": 40,
+  "residual_miss_per_tok": 39.0,
+  "hits_per_tok": 117.0,
+  "effective_residual_rate": 0.25,
+  "substitute_ranks": [],
+  "tpot_prefetch_sync_ms": 122.10043927480001,
+  "stats_prefetch_sync": {
+    "substituted_hit_per_tok": 0.0,
+    "substituted_residual_per_tok": 0.0,
+    "cpu_served_per_tok": 0.0,
+    "fetched_per_tok": 39.0
+  },
+  "tpot_prefetch_cpu_ms": 91.64188207505504,
+  "stats_prefetch_cpu": {
+    "substituted_hit_per_tok": 0.0,
+    "substituted_residual_per_tok": 0.0,
+    "cpu_served_per_tok": 39.0,
+    "fetched_per_tok": 0.0
+  },
+  "tpot_prefetch_capacity_ms": 111.63818055065349,
+  "stats_prefetch_capacity": {
+    "substituted_hit_per_tok": 0.0,
+    "substituted_residual_per_tok": 0.0,
+    "cpu_served_per_tok": 27.2,
+    "fetched_per_tok": 11.8
+  },
+  "tpot_prefetch_controller_ms": 91.64133977465099,
+  "stats_prefetch_controller": {
+    "substituted_hit_per_tok": 0.0,
+    "substituted_residual_per_tok": 0.0,
+    "cpu_served_per_tok": 39.0,
+    "fetched_per_tok": 0.0
+  },
+  "cpu_vs_sync_pct": 24.945493546665098,
+  "capacity_vs_sync_pct": 8.56856763684535,
+  "controller_vs_sync_pct": 24.945937689542284,
+  "controller_vs_cpu_pct": 0.0005917604394083811
+}
