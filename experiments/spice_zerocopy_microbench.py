@@ -67,8 +67,8 @@ def main():
     R, C = di, dm
     mat_mb = R * C * 4 / 1e6
     Wh = torch.randn(R, C).contiguous().pin_memory()           # host pinned
-    wdev = m.map_host(Wh)                                       # mapped device ptr (zero-copy)
-    Wg = Wh.to(dev)                                             # HBM-resident copy for baseline
+    Wg = Wh.to(dev)                                             # HBM-resident copy for baseline (BEFORE register)
+    wdev = m.map_host(Wh)                                       # mapped device ptr (zero-copy) -- register AFTER
     x = torch.randn(C, device=dev); out = torch.empty(R, device=dev)
     Wh_dst = torch.empty(R, C, device=dev)                     # H2D dst
 
