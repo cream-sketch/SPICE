@@ -151,7 +151,9 @@ def simulate(seq, n_layers, n_experts, capacity, policy, comp, A, layer_marg, po
                                          cache, shadow, pf_queue, room, top_k, horizon, rng)
                     for k, tt, tl in cand:
                         pf_queue.append([k, tt, tl, t_fetch]); rec_bytes_issued += comp["expert_mb"]
-                # drain idle PCIe into queue head (preemptible; completes -> shadow)
+                # drain idle PCIe into queue by EARLIEST-DEADLINE-FIRST (codex: near-demand prefetch must
+                # not starve behind far-future ones). Sort by (target_tok, target_layer).
+                pf_queue.sort(key=lambda q: (q[1], q[2]))
                 budget = idle
                 while budget > 1e-9 and pf_queue:
                     q = pf_queue[0]
