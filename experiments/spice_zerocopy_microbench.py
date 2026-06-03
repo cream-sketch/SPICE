@@ -15,15 +15,20 @@ CUDA_SRC = r"""
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
-// GEMV: out[r] = sum_c x[c] * W[r*C + c], W is a HOST-MAPPED device pointer (zero-copy over PCIe).
+// COALESCED GEMV (web-confirmed: zero-copy needs coalesced single-read). One WARP per output row;
+// the 32 lanes read CONSECUTIVE elements of the row (coalesced PCIe burst), then warp-reduce.
+// out[r] = sum_c x[c] * W[r*C + c], W is a HOST-MAPPED device pointer (zero-copy over PCIe).
 __global__ void gemv_zerocopy(const float* __restrict__ x, const float* __restrict__ Wdev,
                               float* __restrict__ out, int R, int C) {
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= R) return;
+    int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= R) return;
+    const float* wrow = Wdev + (long)warp * C;
     float acc = 0.f;
-    const float* wrow = Wdev + (long)r * C;
-    for (int c = 0; c < C; ++c) acc += x[c] * wrow[c];   // reads wrow from host memory over PCIe
-    out[r] = acc;
+    for (int c = lane; c < C; c += 32) acc += x[c] * wrow[c];   // coalesced: lanes read consecutive c
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+    if (lane == 0) out[warp] = acc;
 }
 
 // register a PLAIN (non-pinned) host tensor as MAPPED, return its device pointer (as int64)
@@ -39,7 +44,9 @@ int64_t map_host(torch::Tensor w) {
 void unmap_host(torch::Tensor w) { cudaHostUnregister(w.data_ptr()); }
 
 void run_zerocopy(torch::Tensor x, int64_t wdev, torch::Tensor out, int R, int C) {
-    int threads = 256, blocks = (R + threads - 1) / threads;
+    int threads = 256;                                  // 8 warps/block
+    long total_warps = (long)R;
+    int blocks = (int)((total_warps * 32 + threads - 1) / threads);  // one warp per output row
     gemv_zerocopy<<<blocks, threads>>>(x.data_ptr<float>(), (const float*)wdev, out.data_ptr<float>(), R, C);
 }
 """
