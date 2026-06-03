@@ -50,7 +50,7 @@ def parse_args():
 
 
 # measured CPU burst cost (wall ms for N concurrent missed experts on CPU, intra-op contention)
-CPU_BURST = {0: 0.0, 1: 0.18, 2: 0.56, 3: 1.62, 4: 2.19}
+CPU_BURST = {0: 0.0, 1: 0.136, 2: 0.363, 3: 0.480, 4: 0.704}  # measured 104-thread (was under-threaded 2.19)
 
 
 def cpu_burst(n):
