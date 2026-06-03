@@ -100,31 +100,52 @@ def main():
         if len(routes) < a.decode_tokens:
             routes = (routes * (a.decode_tokens // max(1, len(routes)) + 1))[:a.decode_tokens]
 
+    # shared prefetch buffers (for cpu_serve_prefetch): a pool of GPU staging slots filled async low-pri
+    pf_slots = [(torch.empty(di, dm, device=dev, dtype=dt), torch.empty(di, dm, device=dev, dtype=dt),
+                 torch.empty(dm, di, device=dev, dtype=dt)) for _ in range(8)]
+    pf_stream = torch.cuda.Stream(dev, priority=0)
+
     def run_decode(policy):
         torch.cuda.synchronize(dev)
         t0 = time.perf_counter()
         for ti in range(len(routes)):
             h = torch.randn(1, dm, device=dev, dtype=dt)
+            prefetched = {}            # (l,e) -> slot_idx ready this token (cpu_serve_prefetch, oracle)
+            pf_events = {}             # (l,e) -> cuda event
+            slot_rr = 0
             for l in range(a.n_layers):
                 h = h + attn(l, h)
                 hn = h
                 _ = F.linear(hn, Wrt[l])           # router
                 out = shared(l, hn)
                 for e in routes[ti][l]:
-                    if (l, e) in gpu_experts:
-                        out = out + gpu_expert(gpu_experts[(l, e)], hn)
+                    key = (l, e)
+                    if key in gpu_experts:
+                        out = out + gpu_expert(gpu_experts[key], hn)
+                    elif policy == "cpu_serve_prefetch" and key in prefetched and pf_events[key].query():
+                        out = out + gpu_expert(pf_slots[prefetched[key]], hn)   # prefetched hit (real)
                     else:
-                        hw = host_experts[(l, e)]
                         if policy == "fetch_on_miss":
                             with torch.cuda.stream(copy_stream):
-                                for s, dd in zip(hw, stage): dd.copy_(s, non_blocking=True)
+                                for s, dd in zip(host_experts[key], stage): dd.copy_(s, non_blocking=True)
                             torch.cuda.current_stream(dev).wait_stream(copy_stream)
                             out = out + gpu_expert(stage, hn)
-                        else:  # cpu_serve
-                            hc = hn.float().cpu()
-                            g, u, d = host_cpu
+                        else:  # cpu_serve and cpu_serve_prefetch fallback: CPU exact serve
+                            hc = hn.float().cpu(); g, u, d = host_cpu
                             oc = F.linear(F.silu(F.linear(hc, g)) * F.linear(hc, u), d)
                             out = out + oc.to(dev, dtype=dt)
+                # ORACLE prefetch on freed PCIe: while CPU serves, low-pri H2D next layers' TRUE experts
+                if policy == "cpu_serve_prefetch":
+                    for jl in range(l + 1, min(l + 3, a.n_layers)):
+                        for je in routes[ti][jl]:
+                            if (jl, je) in gpu_experts or (jl, je) in prefetched: continue
+                            if (jl, je) not in host_experts: continue
+                            sidx = slot_rr % len(pf_slots); slot_rr += 1
+                            with torch.cuda.stream(pf_stream):
+                                for s, dd in zip(host_experts[(jl, je)], pf_slots[sidx]):
+                                    dd.copy_(s, non_blocking=True)
+                                ev = torch.cuda.Event(); ev.record(pf_stream)
+                            prefetched[(jl, je)] = sidx; pf_events[(jl, je)] = ev
                 h = h + out
         torch.cuda.synchronize(dev)
         return (time.perf_counter() - t0) / len(routes) * 1000.0  # ms/token
@@ -134,12 +155,15 @@ def main():
     run_decode("cpu_serve")
     res["tpot_fetch_on_miss_ms"] = run_decode("fetch_on_miss")
     res["tpot_cpu_serve_ms"] = run_decode("cpu_serve")
+    res["tpot_cpu_serve_prefetch_ms"] = run_decode("cpu_serve_prefetch")  # ORACLE freed-PCIe prefetch
     res["fiddler_ablation_pct"] = 100 * (res["tpot_fetch_on_miss_ms"] - res["tpot_cpu_serve_ms"]) / res["tpot_fetch_on_miss_ms"]
+    res["spice_rec_oracle_vs_fiddler_pct"] = 100 * (res["tpot_cpu_serve_ms"] - res["tpot_cpu_serve_prefetch_ms"]) / res["tpot_cpu_serve_ms"]
     print(json.dumps(res, indent=2), flush=True)
     with open(a.out, "w") as f: json.dump(res, f, indent=2)
-    print(f"\n[REAL wall-clock] SPICE-original fetch-on-miss = {res['tpot_fetch_on_miss_ms']:.3f} ms/token; "
-          f"SPICE+Fiddler cpu-serve = {res['tpot_cpu_serve_ms']:.3f} ms/token; "
-          f"Fiddler ablation = {res['fiddler_ablation_pct']:+.1f}%", flush=True)
+    print(f"\n[REAL wall-clock] fetch-on-miss={res['tpot_fetch_on_miss_ms']:.3f} cpu-serve(Fiddler)={res['tpot_cpu_serve_ms']:.3f} "
+          f"cpu+oracle-prefetch={res['tpot_cpu_serve_prefetch_ms']:.3f} ms/token", flush=True)
+    print(f"[REAL] Fiddler ablation={res['fiddler_ablation_pct']:+.1f}% ; "
+          f"SPICE-REC(oracle freed-PCIe prefetch) vs Fiddler={res['spice_rec_oracle_vs_fiddler_pct']:+.1f}%", flush=True)
 
 
 if __name__ == "__main__":
