@@ -544,6 +544,8 @@ Evidence:
 - `notes/evidence/gos_qwen_t16_64_f4096_recent_admit_w8_v10.json`
 - `notes/evidence/gos_deepseek_oracle_256_hotter_admit_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_recent_admit_w8_v1.json`
+- `notes/evidence/ds_forecast_wiki64_v1_metrics.json`
+- `notes/evidence/ds_gos_real_forecast_256_diag_v1/shallow_vs_gos_transient.json`
 - `notes/evidence/gos_qwen_wiki64_64_greedy_transient_fairparams_v5.json`
 - `notes/evidence/gos_qwen_wiki64_64_dp_transient_fairparams_v4.json`
 - `notes/evidence/gos_qwen_wiki64_64_always_admit_fairparams_v5.json`
@@ -592,6 +594,21 @@ DeepSeek as well. The perturbation control is strongly negative, which weakens t
 but it is still a state-divergent control rather than a clean identical-traffic causal replay. Unlike Qwen, resident
 admission is slightly better than transient-only in this oracle setting, which means the cache-admission decision should
 be model/regime-aware rather than hard-coded to "never admit".
+
+DeepSeek now also has a real training-free SPICE draft forecast on the same WikiText-style 64-text dump:
+`recall@top6 = 1.00/0.873/0.816/0.770/0.733/0.697` for horizons 1..6, versus about `0.095` for anchor-repeat.
+A first shared-node diagnostic run with this **real** forecast (not oracle), 256 test tokens and 3 repeats, gives:
+
+| policy | TPOT ms | range ms | CPU misses/tok | staged useful/tok | active wait ms/tok |
+|---|---:|---:|---:|---:|---:|
+| shallow CPU, transient staging | 84.04 | 83.87-84.22 | 81.64 | 44.43 | 16.83 |
+| GOS transient staging | 68.72 | 68.22-68.82 | 83.30 | 42.76 | 0.00 |
+| GOS dummy traffic control | 82.39 | 82.37-82.78 | 126.06 | 0.00 | 0.00 |
+
+This is not yet a final paper number because the run was on shared 248 while other GPU jobs were alive, but it is an
+important data-flow check: real DeepSeek SPICE forecasts are good enough for GOS, and the dummy control shows the gain
+comes from consumed on-time staging rather than copy traffic noise. The next decisive step is a 1024-token isolated
+DeepSeek run on an idle machine.
 
 ### Cache-admission policy sweep
 
