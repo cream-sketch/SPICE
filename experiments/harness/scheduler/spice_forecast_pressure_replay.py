@@ -1,6 +1,6 @@
 """Replay SPICE draft-forecast residual misses under PCIe pressure.
 
-This harness consumes `qwen_spice_draft.py --dump_forecast` files:
+This harness consumes `spice_draft.cli --dump_forecast` files:
 
   true_top: [layers, tokens, top_k]
   fcast   : [anchor_layer, horizon, tokens, top_k]
