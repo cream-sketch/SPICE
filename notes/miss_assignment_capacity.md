@@ -544,6 +544,10 @@ Evidence:
 - `notes/evidence/gos_qwen_t16_64_f4096_recent_admit_w8_v10.json`
 - `notes/evidence/gos_deepseek_oracle_256_hotter_admit_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_recent_admit_w8_v1.json`
+- `notes/evidence/gos_qwen_wiki64_64_greedy_transient_fairparams_v3.json`
+- `notes/evidence/gos_qwen_wiki64_64_dp_transient_fairparams_v2.json`
+- `notes/evidence/gos_qwen_wiki64_64_always_admit_fairparams_v3.json`
+- `notes/evidence/gos_qwen_wiki64_64_oracle_admit_fairparams_v2.json`
 
 The larger WikiText-derived Qwen forecast dump contains 64 texts and 6681 total tokens. The runtime uses `lead=1` for
 the next layer; this corresponds to the dump quality report's `horizon=2` because `horizon=1` is the same-layer exact
@@ -612,6 +616,35 @@ in both matched runs. The useful lesson is negative but actionable: cache promot
 onto GOS. It must be part of the same global resource scheduler, using measured regime feedback (CPU pressure, HBM churn,
 and future useful-hit value) to choose among always-admit, transient-only, or a calibrated intermediate policy.
 
+### Global scheduler/admission kill-test
+
+The next implementation added two global diagnostics to the CUDA runtime:
+
+- `--gos_scheduler=dp`: a rolling-horizon DP over forecast targets, where state is the number of already selected low-H2D
+  copies plus the selected key set. This prevents duplicate expert value/copy accounting and enforces the same deadline
+  and staging-slot constraints as the greedy scheduler.
+- `--prefetch_hit_admission=oracle_value --allow_oracle_admission`: a true-future upper-bound resident-cache admission
+  test. It compares a staged hit's future reuse value against the Least-Stale victim's future reuse value within a
+  16-token horizon. The explicit guard is required because this reads `true_top` and is not deployable.
+
+The runtime also fixed a stale active-copy corner case: an expired low-stream copy is no longer counted as a useful hit
+when `wait_active()` sees it after the logical deadline. In the fixed runs below, that counter is zero, so this bug did
+not drive the result.
+
+Qwen WikiText 64-token fair-parameter rerun (`seed=11`, `gos_layer_slack_ms=0.8`, `gos_cpu_overlap_ms=0.3`, 3 repeats):
+
+| policy | TPOT ms | CPU misses/tok | staged useful/tok | resident admits/tok | global rejects/tok |
+|---|---:|---:|---:|---:|---:|
+| greedy GOS, transient staging only | 46.27 | 42.81 | 37.53 | 0.00 / 37.53 | 0.00 |
+| DP GOS, transient staging only | 47.70 | 44.03 | 36.31 | 0.00 / 36.31 | 16.00 |
+| greedy GOS, always admit staged hits | 47.90 | 39.02 | 35.66 | 35.66 / 35.66 | 0.00 |
+| greedy GOS, oracle-value resident admission | 50.31 | 36.45 | 34.72 | 6.34 / 34.72 | 0.00 |
+
+This is the decisive resident-admission kill-test for the Qwen real-SPICE regime. A more global DP and even true-future
+resident admission do not beat transient staging. DP rejects about 16 targets/token globally and loses useful staging
+hits; oracle admission reduces CPU misses but pays enough resident D2D/cache churn and loses enough staging utility that
+TPOT gets worse. The mainline therefore remains **GOS as transient overflow staging**, not long-lived resident promotion.
+
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
 state. It is therefore a perturbation sanity check, not a definitive causal isolation. Injecting GOS-admitted H2D traffic
 without consuming the staged experts is much slower (`60.74ms` on the 64-token diagnostic and `57.72ms` on the 1024-token
@@ -622,6 +655,10 @@ Interpretation:
 
 - Correct forecasts should not automatically become resident-cache admissions. The useful primitive is **transient
   staging**: a one-shot H2D service path for predicted overflow misses.
+- A global DP over forecast targets is implemented and useful as a diagnostic, but the Qwen real-SPICE regime does not
+  need it as the mainline policy: greedy transient staging is faster in the fixed fair rerun.
+- True-future resident admission is an upper-bound diagnostic only. Its failure to beat transient staging strengthens
+  the conclusion that the cost is not just a weak admission predictor; resident promotion itself is often the wrong action.
 - GOS is a positive, SPICE-native miss-handling mechanism in the measured Qwen pressure regime: it uses SPICE
   future-demand information to choose which misses should consume PCIe and which should remain CPU-served. The DeepSeek
   evidence above is oracle-only upper-bound evidence for the same resource controller, not a deployable SPICE predictor

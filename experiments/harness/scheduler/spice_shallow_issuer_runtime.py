@@ -347,6 +347,9 @@ class ShallowIssuer:
     def wait_active(self, key):
         for i, item in enumerate(self.active_low):
             if item["key"] == key:
+                if item.get("expired", False):
+                    self.stats["prefetch_wait_active_expired"] += 1
+                    return None
                 t0 = time.perf_counter()
                 item["event"].synchronize()
                 self.stats["prefetch_waited_active_ms"] += (time.perf_counter() - t0) * 1000.0
@@ -525,20 +528,13 @@ def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: S
     reserved0 = issuer.low_reserved_count()
     low_slots = len(issuer.low_slots)
     targets = []
-    global_seen = set()
     for target, ranked in sorted(candidates_by_target.items(), key=lambda x: x[0]):
         target_token, target_layer, lead = target
         if stats is not None:
             stats["gos_targets"] += 1
             stats["gos_backlog_copies"] += backlog0
             stats["gos_slot_reserved"] += reserved0
-        ranked_unique = []
-        for key in ranked:
-            if key in global_seen:
-                continue
-            ranked_unique.append(key)
-            global_seen.add(key)
-        options, info = gos_target_options(ranked_unique, resident_or_staged, reserved0, backlog0, low_slots, lead,
+        options, info = gos_target_options(ranked, resident_or_staged, reserved0, backlog0, low_slots, lead,
                                            cost_table, t_fetch, t_gpu, args, stats)
         deadline_copies = int((lead * args.gos_layer_slack_ms) // t_fetch) if t_fetch > 0 else low_slots
         targets.append({
@@ -548,26 +544,35 @@ def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: S
             "deadline_copies": deadline_copies,
         })
 
-    # State: cumulative newly admitted H2D copies -> (total value, path).
-    dp = {0: (0.0, [])}
+    # State: (cumulative newly admitted H2D copies, selected keys) -> (value, path).
+    # Tracking keys prevents duplicate value/copy accounting while still allowing
+    # a repeated key to be chosen by a later target if an earlier target skipped it.
+    dp = {(0, frozenset()): (0.0, [])}
     for idx, target in enumerate(targets):
         next_dp = {}
-        for used_copies, (value, path) in dp.items():
+        for (used_copies, used_keys), (value, path) in dp.items():
             for option in target["options"]:
+                option_keys = frozenset(option["keys"])
+                if option_keys & used_keys:
+                    continue
                 nc = used_copies + option["f"]
                 if reserved0 + nc > low_slots:
                     continue
                 if backlog0 + nc > target["deadline_copies"]:
                     continue
                 nv = value + option["value"]
-                old = next_dp.get(nc)
-                if old is None or nv > old[0] or (nv == old[0] and nc < sum(o["f"] for _i, o in old[1])):
-                    next_dp[nc] = (nv, path + [(idx, option)])
-        dp = next_dp or {0: (0.0, [])}
+                state = (nc, used_keys | option_keys)
+                old = next_dp.get(state)
+                if old is None or nv > old[0]:
+                    next_dp[state] = (nv, path + [(idx, option)])
+        dp = next_dp or {(0, frozenset()): (0.0, [])}
         if stats is not None:
             stats["gos_dp_states"] += len(dp)
 
-    best_value, best_path = max(dp.values(), key=lambda x: (x[0], -sum(o["f"] for _i, o in x[1]))) if dp else (0.0, [])
+    if dp:
+        (_best_copies, _best_keys), (best_value, best_path) = max(dp.items(), key=lambda x: (x[1][0], -x[0][0]))
+    else:
+        best_value, best_path = 0.0, []
     selected = {idx: option for idx, option in best_path if option["f"] > 0}
     admitted = []
     for idx, target in enumerate(targets):
@@ -1017,7 +1022,7 @@ def main() -> None:
                   "gos_dp_selected_copies",
                   "prefetch_intents", "prefetch_submitted", "prefetch_completed", "prefetch_useful",
                   "prefetch_waited_active", "prefetch_intent_cancelled", "prefetch_intent_expired",
-                  "prefetch_staged_expired", "prefetch_completed_expired",
+                  "prefetch_staged_expired", "prefetch_completed_expired", "prefetch_wait_active_expired",
                   "prefetch_waited_active_ms", "residual_fetch_wait_ms"]:
             row[f"{k}_per_tok"] = row.get(k, 0.0) / max(1, row["tokens"])
         rows.append(row)
