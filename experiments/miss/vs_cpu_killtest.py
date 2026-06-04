@@ -16,14 +16,20 @@ GO if value_accept@1e-2 >= ~0.5 at some d>=2. All printed English. Core params: 
 """
 import sys, pathlib  # bootstrap: resolve local + harness siblings regardless of CWD
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "harness" / "datagen"))  # qwen_spice_draft moved to datagen/
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "harness" / "datagen"))  # spice_draft package
 
 import argparse, json, types
 from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import torch
-from qwen_spice_draft import shared_only_mlp_forward, true_forward, topk_sets_from_logits
+# Unified training-free draft (was qwen_spice_draft). shared_only_mlp_forward + topk_sets_from_logits
+# map directly; true_forward wraps the Qwen adapter (returns {layer: topk} dict, indexable by [int]).
+from spice_draft.adapters.qwen2_moe import _shared_only_mlp_forward as shared_only_mlp_forward, Qwen2MoEAdapter
+from spice_draft.adapters.base import topk_sets_from_logits
+_QWEN_ADAPTER = Qwen2MoEAdapter()
+def true_forward(model, input_ids, attention_mask, top_k):
+    return _QWEN_ADAPTER.true_forward(model, input_ids, attention_mask, top_k)
 
 
 def parse_args():
