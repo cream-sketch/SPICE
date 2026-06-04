@@ -16,7 +16,7 @@ GO if value_accept@1e-2 >= ~0.5 at some d>=2. All printed English. Core params: 
 """
 import sys, pathlib  # bootstrap: resolve local + harness siblings regardless of CWD
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "harness"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "harness" / "datagen"))  # qwen_spice_draft moved to datagen/
 
 import argparse, json, types
 from pathlib import Path
