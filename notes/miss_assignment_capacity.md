@@ -538,6 +538,8 @@ Evidence:
 - `notes/evidence/gos_deepseek_oracle_256_normal_admit_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_servedonly_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_dummy_v1.json`
+- `notes/evidence/gos_qwen_wiki64_64_normal_admit_fair_v1.json`
+- `notes/evidence/gos_qwen_wiki64_64_servedonly_fair_v1.json`
 - `notes/evidence/gos_qwen_t16_64_f4096_hotter_admit_v9.json`
 - `notes/evidence/gos_qwen_t16_64_f4096_recent_admit_w8_v10.json`
 - `notes/evidence/gos_deepseek_oracle_256_hotter_admit_v1.json`
@@ -587,9 +589,10 @@ be model/regime-aware rather than hard-coded to "never admit".
 
 ### Cache-admission policy sweep
 
-The Qwen and DeepSeek results disagree on whether a staged hit should be promoted into the resident expert cache after
-use: Qwen prefers transient-only staging, while DeepSeek's oracle run prefers always admitting staged hits. Two simple
-online admission heuristics were therefore tested:
+The results disagree on whether a staged hit should be promoted into the resident expert cache after use. Qwen's 1024-token
+run above prefers transient-only staging, but a same-input 64-token WikiText rerun prefers always admitting staged hits;
+DeepSeek's oracle run also prefers always admitting staged hits. This is already enough to rule out a fixed local rule.
+Two simple online admission heuristics were tested on matched inputs:
 
 - `hotter_than_victim`: admit only if the candidate's train-trace popularity exceeds the LS victim's popularity.
 - `recent_reuse`: admit if the candidate has more recent same-layer route reuse than the LS victim within an 8-token
@@ -597,14 +600,17 @@ online admission heuristics were therefore tested:
 
 | model/run | always admit | never admit | hotter-than-victim | recent-reuse w=8 |
 |---|---:|---:|---:|---:|
-| Qwen 64-token real SPICE forecast | 47.76 ms | 44.23 ms | 49.42 ms | 49.10 ms |
-| DeepSeek 256-token oracle forecast | 65.38 ms | 67.01 ms | 88.45 ms | 68.56 ms |
+| Qwen WikiText 64-token real SPICE forecast | 46.92 ms | 48.88 ms | 49.42 ms | 49.10 ms |
+| DeepSeek 256-token oracle forecast | 65.38 ms | 67.01 ms | 88.45 ms* | 68.56 ms |
 
-These simple cache heuristics are not good enough. `hotter_than_victim` rejects nearly every staged-hit promotion, which
-removes DeepSeek's resident-cache benefit. `recent_reuse` admits a subset, but still misses the better extreme in both
-tested regimes. The useful lesson is negative but actionable: cache promotion cannot be a local hotness rule bolted onto
-GOS. It must be part of the same global resource scheduler, using measured regime feedback (CPU pressure, HBM churn, and
-future useful-hit value) to choose among always-admit, transient-only, or a calibrated intermediate policy.
+`*` DeepSeek `hotter_than_victim` accepted zero promotions, so its cache state is equivalent to never-admit; the 2-repeat
+timing was noisy (`72.35-104.55ms`) and should not be read as a distinct policy cost.
+
+These simple cache heuristics are not good enough. `hotter_than_victim` usually rejects every staged-hit promotion because
+the warm cache already contains the train-hot experts. `recent_reuse` admits a subset, but still misses the better extreme
+in both matched runs. The useful lesson is negative but actionable: cache promotion cannot be a local hotness rule bolted
+onto GOS. It must be part of the same global resource scheduler, using measured regime feedback (CPU pressure, HBM churn,
+and future useful-hit value) to choose among always-admit, transient-only, or a calibrated intermediate policy.
 
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
 state. It is therefore a perturbation sanity check, not a definitive causal isolation. Injecting GOS-admitted H2D traffic
