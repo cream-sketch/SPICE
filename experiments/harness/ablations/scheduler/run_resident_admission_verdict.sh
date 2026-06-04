@@ -14,7 +14,7 @@
 #   experiments/harness/scheduler/run_admit_isolated_v5.sh [gpu] [numa_node] [out_dir]
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$ROOT"
 
 PY="${PY:-/home/ziheng/miniforge3/envs/sparmoe/bin/python}"
@@ -41,14 +41,14 @@ snapshot() {
   {
     echo "===== snapshot: $label ====="
     date
-    pgrep -af 'spice_shallow_issuer_runtime.py' || true
+    pgrep -af 'spice_shallow_issuer_runtime.py\|resident_admission_runtime.py' || true
     nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
     echo
   } | tee -a "$LOG"
 }
 
 other_runtime_count() {
-  pgrep -af 'spice_shallow_issuer_runtime.py' | grep -v "pgrep -af" | wc -l
+  pgrep -af 'spice_shallow_issuer_runtime.py\|resident_admission_runtime.py' | grep -v "pgrep -af" | wc -l
 }
 
 if [[ "$(other_runtime_count)" -ne 0 ]]; then
@@ -78,7 +78,7 @@ common() {
   local label="$1"
   shift
   snapshot "before-$label"
-  "${BIND[@]}" "$PY" experiments/harness/scheduler/spice_shallow_issuer_runtime.py \
+  "${BIND[@]}" "$PY" experiments/harness/ablations/scheduler/resident_admission_runtime.py \
     --forecast_dir "$FC" --cost_json "$COST" --gpu "$GPU" \
     --train_frac 0.5 --residency 0.1 --max_test_tokens "$TOK" \
     --d_model 2048 --d_inter 1408 --top_k 4 --cpu_threads "$CPU_THREADS" --cpu_dtype bf16 \
