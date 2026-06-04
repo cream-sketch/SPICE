@@ -498,3 +498,62 @@ Interpretation:
 - This does not invalidate the event replay. It sharpens the implementable story: SPICE should be a verified
   expert-demand oracle feeding a resource-DAG admission controller, not a fetch-all prefetcher. The controller's first
   job is deciding when *not* to turn a correct forecast into PCIe traffic.
+
+## SPICE-GOS: global overflow staging, not residency
+
+The next runtime revision separates two actions that SPICE-style prefetch usually couples:
+
+1. **Transient staging service:** fetch a forecasted future expert into a low-priority staging slot, use it exactly once
+   when that future miss arrives, then release the staging slot.
+2. **Resident cache admission:** copy the staged expert into the long-lived HBM expert cache after use.
+
+This distinction matters on the real resource DAG. A staged expert can reduce future CPU fallback burst, but promoting
+that same 17MB expert into the resident cache adds a main-stream D2D copy and extra cache churn. In the earlier runtime,
+GOS served the miss and then admitted every low-prefetch hit into the cache, which often erased the scheduling gain.
+
+Implementation: `experiments/harness/spice_shallow_issuer_runtime.py`, policy `gos_cpu` with
+`--no_admit_prefetch_hits`.
+
+GOS admission is a rolling-horizon controller over SPICE forecast targets. For each future `(token, layer)`, it admits a
+prefix of forecasted experts only if:
+
+- the low-priority H2D backlog can complete before the future-layer deadline,
+- the CPU miss-burst cost is covered by measured CPU rows rather than extrapolation, and
+- the action reduces the target-layer critical-path increment:
+  `max(0, CPU_burst - overlap_window) -> max(prefetched_gpu_compute, remaining_CPU_burst - overlap_window)`.
+
+Evidence:
+
+- `notes/evidence/gos_qwen_t16_64_f4096_depth0_final_v8.json`
+- `notes/evidence/gos_qwen_t16_64_f4096_normal_admit_final_v8.json`
+- `notes/evidence/gos_qwen_t16_64_f4096_servedonly_final_v8.json`
+- `notes/evidence/gos_qwen_t16_64_f4096_dummy_final_v8.json`
+
+Qwen top-4, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 64 tokens, one 4096 bf16 filler GEMM/layer:
+
+| policy | TPOT ms | speedup vs CPU-only | resident hit/tok | staging hit/tok | CPU misses/tok | staged H2D/tok | cache evict/tok | active wait/tok |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| depth0 CPU fallback | 49.00 | 1.00x | 24.83 | 0.00 | 71.17 | 0.00 | 0.00 | 0.00 |
+| GOS + resident admission | 47.76 | 1.03x | 20.02 | 35.83 | 40.16 | 39.88 | 35.83 | 0.00 |
+| GOS transient staging only | 44.23 | 1.11x | 24.83 | 33.73 | 37.44 | 37.61 | 0.00 | 0.00 |
+| GOS perturbation control | 60.74 | 0.81x | 24.83 | 0.00 | 71.17 | 38.12 | 0.00 | 0.00 |
+
+The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
+state. It still rules out the easiest false explanation. Injecting GOS-admitted H2D traffic without consuming the staged
+experts is much slower (`60.74ms` in the filler regime), so the gain is not from copy-engine noise; it comes from useful
+on-time staging that reduces CPU miss burst.
+
+Interpretation:
+
+- Correct forecasts should not automatically become resident-cache admissions. The useful primitive is **transient
+  staging**: a one-shot H2D service path for predicted overflow misses.
+- GOS is a positive, SPICE-native miss-handling mechanism in the measured pressure regime: it uses SPICE future-demand
+  information to choose which misses should consume PCIe and which should remain CPU-served.
+- The gain is regime-dependent. A no-filler stress run showed small positive results in one batch but substantial timing
+  noise in a later rerun, so it is not used as main evidence yet. This supports a resource-DAG story rather than a
+  universal prefetch story.
+- `--gos_cpu_overlap_ms` is a calibrated policy constant in this diagnostic harness. The final system needs to estimate
+  it online or replace it with measured per-layer slack.
+- Remaining evidence needed before paper-level claims: DeepSeek replication, larger forecast traces, Nsight confirmation
+  that the main gain is removal of low-hit D2D cache admission, and a calibrated production overlap model instead of a
+  fixed `--gos_cpu_overlap_ms`.
