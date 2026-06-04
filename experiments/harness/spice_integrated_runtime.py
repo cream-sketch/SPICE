@@ -1,6 +1,6 @@
-"""REAL timing scaffold: SPICE prefetch + capacity-aware verified-fallback (real wall-clock).
+"""Diagnostic timing scaffold: SPICE prefetch + capacity-aware verified-fallback.
 
-REAL 集成 runtime: SPICE prefetch + capacity-aware verified-fallback (两个策略都用, 真实 wall-clock).
+诊断用 timing scaffold: SPICE prefetch + capacity-aware verified-fallback.
 
 SPICE prefetch and the capacity-aware fallback are ORTHOGONAL (user's point):
   - SPICE prefetch (paper: 74.24% slot hit, up to 2.86x TPOT) reduces the MISS RATE by predicting
@@ -16,13 +16,15 @@ contends PCIe with the capacity fallback's fetches -- a real effect that favors 
 D2H is done ONCE per layer. Each policy is warmed up separately. No RNG inside the timed loop.
 
 Policies (prefetch ON for all; only residual fallback differs):
-  prefetch_sync     : SPICE original  = residual miss -> synchronous per-expert H2D fetch + GPU GEMM; admit.
-  prefetch_cpu      : SPICE + Fiddler = residual miss -> all-CPU serve (DRAM, parallel to PCIe); no admit.
-  prefetch_capacity : SPICE + NEW     = residual miss -> capacity split (n_fetch on PCIe || n_cpu on CPU); admit fetched only.
+  prefetch_sync     : SPICE original timing = residual miss -> synchronous per-expert H2D fetch + GPU GEMM.
+  prefetch_cpu      : SPICE + Fiddler timing = residual miss -> all-CPU serve.
+  prefetch_capacity : residual miss -> fixed CPU/PCIe split.
+  prefetch_pressure_dp : residual miss -> layer-serial pressure-aware CPU/PCIe split.
 
 All ops are real tensor ops (attn/shared/router/experts), real KV, bf16 path timing, batch=1 decode.
-This is a timing scaffold, not a full exact-logit model replay: resident-hit weights are synthetic timing
-weights and HBM admission/cache feedback is handled by the trace replay harness.
+This remains diagnostic, not a source-only baseline and not a full exact-logit model replay:
+resident-hit weights are synthetic timing weights, residual masks are synthetic unless supplied by
+another harness, and HBM admission/cache feedback is handled by trace replay.
 target_residual_rate calibrates the prefetch operating point (paper 0.2576). All printed English.
 Core params: no defaults (cpu_dtype/seed have defaults).
 """
@@ -33,7 +35,7 @@ import torch.nn.functional as F
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="SPICE prefetch + capacity-aware fallback integrated runtime")
+    ap = argparse.ArgumentParser(description="Diagnostic SPICE prefetch + capacity-aware fallback timing scaffold")
     ap.add_argument("--gpu", type=int, required=True)
     ap.add_argument("--n_layers", type=int, required=True)
     ap.add_argument("--d_model", type=int, required=True)
@@ -177,9 +179,26 @@ def main():
             return 0.0
         return cost_table[(n_cpu, 0)]
 
+    def layer_serial_plan_step(clock, prev_fetches, hit_count, nmiss, n_fetch):
+        n_fetch = max(0, min(nmiss, n_fetch))
+        n_cpu = nmiss - n_fetch
+        base_done = clock + a.scheduler_dense_ms_per_layer + hit_count * a.scheduler_t_gpu_ms
+        if nmiss == 0:
+            return base_done, prev_fetches, 0.0
+        if n_fetch == 0:
+            return base_done + cpu_plan_cost(n_cpu), prev_fetches, 0.0
+        cpu_ms = cpu_plan_cost(n_cpu)
+        no_backlog_service = max(cost_table[(nmiss, n_fetch)], cpu_ms,
+                                 n_fetch * (a.scheduler_t_fetch_h2d_ms + a.scheduler_t_gpu_ms))
+        copy_ready = a.scheduler_prefetch_floor_ms_per_tok + prev_fetches * a.scheduler_t_fetch_h2d_ms
+        pcie_wait = max(0.0, copy_ready - base_done)
+        blocked_fetch_service = pcie_wait + n_fetch * a.scheduler_t_fetch_h2d_ms + n_fetch * a.scheduler_t_gpu_ms
+        service = max(no_backlog_service, cpu_ms, blocked_fetch_service)
+        return base_done + service, prev_fetches + n_fetch, pcie_wait
+
     def dp_fetch_counts_for_token(ti):
-        """Exact resource-DAG planner for this token's residual misses."""
-        dp = {0: (0.0, [])}
+        """Layer-serial timing planner for this token's residual misses."""
+        dp = {0: (0.0, [], 0.0)}
         for l in range(L):
             hit_count = 0
             nmiss = 0
@@ -190,36 +209,25 @@ def main():
                     nmiss += 1
                 else:
                     hit_count += 1
-            opts = []
-            for nf in range(nmiss + 1):
-                nc = nmiss - nf
-                compute = (
-                    a.scheduler_dense_ms_per_layer
-                    + hit_count * a.scheduler_t_gpu_ms
-                    + cpu_plan_cost(nc)
-                    + nf * a.scheduler_t_gpu_ms
-                )
-                opts.append((nf, compute))
             ndp = {}
-            for prev_fetches, (prev_compute, prev_choices) in dp.items():
-                for nf, compute in opts:
-                    total_fetches = prev_fetches + nf
-                    total_compute = prev_compute + compute
+            for prev_fetches, (clock, prev_choices, wait_sum) in dp.items():
+                for nf in range(nmiss + 1):
+                    total_clock, total_fetches, wait = layer_serial_plan_step(clock, prev_fetches, hit_count, nmiss, nf)
                     old = ndp.get(total_fetches)
-                    if old is None or total_compute < old[0]:
-                        ndp[total_fetches] = (total_compute, prev_choices + [nf])
+                    if old is None or total_clock < old[0]:
+                        ndp[total_fetches] = (total_clock, prev_choices + [nf], wait_sum + wait)
             dp = ndp
         best = None
-        for total_fetches, (compute_ms, choices) in dp.items():
+        for total_fetches, (clock_ms, choices, wait_sum) in dp.items():
             pcie_ms = a.scheduler_prefetch_floor_ms_per_tok + total_fetches * a.scheduler_t_fetch_h2d_ms
-            item = (max(compute_ms, pcie_ms), total_fetches, compute_ms, pcie_ms, choices)
+            item = (max(clock_ms, pcie_ms), total_fetches, clock_ms, pcie_ms, choices, wait_sum)
             if best is None or item < best:
                 best = item
         assert best is not None
         return best
 
     def serve_residual(policy, misses, l, hn_gpu, sub_stats, n_fetch_override=None):
-        # misses: list of (expert, rank). Returns residual contribution tensor on GPU; REAL fetch/cpu service.
+        # misses: list of (expert, rank). Returns residual contribution tensor on GPU; timed fetch/cpu service.
         # sub_stats: [substituted, cpu_served, fetched] counters (mutated). hn_gpu: (1, dm) on GPU.
         if not misses:
             return None
@@ -271,7 +279,8 @@ def main():
         return acc
 
     def run_decode(policy):
-        sub_stats = [0, 0, 0, 0, 0, 0.0, 0.0]  # [sub_hit, sub_resid, cpu, fetch, dp_fetch, dp_compute, dp_pcie]
+        sub_stats = [0, 0, 0, 0, 0, 0.0, 0.0, 0.0]
+        # [sub_hit, sub_resid, cpu, fetch, dp_fetch, dp_layer_clock, dp_pcie, dp_pcie_wait]
         # controller substitutes low-gate-mass (high-rank) slots: skip BOTH prefetch H2D AND serve,
         # relying on the always-on shared expert. This removes their PCIe traffic -> lowers the floor.
         do_sub = (policy == "prefetch_controller")
@@ -282,11 +291,12 @@ def main():
             h = torch.randn(1, dm, device=dev, dtype=dt)
             dp_plan = None
             if policy == "prefetch_pressure_dp":
-                _tok_ms, total_fetches, compute_ms, pcie_ms, choices = dp_fetch_counts_for_token(ti)
+                _tok_ms, total_fetches, layer_clock_ms, pcie_ms, choices, wait_ms = dp_fetch_counts_for_token(ti)
                 dp_plan = choices
                 sub_stats[4] += total_fetches
-                sub_stats[5] += compute_ms
+                sub_stats[5] += layer_clock_ms
                 sub_stats[6] += pcie_ms
+                sub_stats[7] += wait_ms
             for l in range(L):
                 h = h + attn(l, h)
                 hn = h
@@ -330,8 +340,9 @@ def main():
         res[f"stats_{pol}"] = {"substituted_hit_per_tok": st[0] / T, "substituted_residual_per_tok": st[1] / T,
                                "cpu_served_per_tok": st[2] / T, "fetched_per_tok": st[3] / T,
                                "dp_planned_fetches_per_tok": st[4] / T,
-                               "dp_planned_compute_ms_per_tok": st[5] / T,
-                               "dp_planned_pcie_ms_per_tok": st[6] / T}
+                               "dp_planned_layer_clock_ms_per_tok": st[5] / T,
+                               "dp_planned_pcie_ms_per_tok": st[6] / T,
+                               "dp_planned_pcie_wait_ms_per_tok": st[7] / T}
         print(f"[{pol:>20}] TPOT={ms:8.3f} ms/token  subst_hit/tok={st[0]/T:5.2f} subst_resid/tok={st[1]/T:5.2f} "
               f"cpu/tok={st[2]/T:5.2f} fetch/tok={st[3]/T:5.2f} dp_fetch/tok={st[4]/T:5.2f}", flush=True)
     base = res["tpot_prefetch_sync_ms"]
@@ -347,7 +358,7 @@ def main():
         res["controller_vs_sync_pct"] = 100 * (base - res["tpot_prefetch_controller_ms"]) / base
         if "tpot_prefetch_cpu_ms" in res:
             res["controller_vs_cpu_pct"] = 100 * (res["tpot_prefetch_cpu_ms"] - res["tpot_prefetch_controller_ms"]) / res["tpot_prefetch_cpu_ms"]
-    print(f"\n[REAL] residual_miss/tok={residual_per_tok:.2f} (rate={res['effective_residual_rate']:.3f}) "
+    print(f"\n[diagnostic] residual_miss/tok={residual_per_tok:.2f} (rate={res['effective_residual_rate']:.3f}) "
           f"substitute_ranks={sorted(substitute_ranks)} | cpu vs sync={res.get('cpu_vs_sync_pct', float('nan')):+.1f}%  "
           f"pressure_dp vs sync={res.get('pressure_dp_vs_sync_pct', float('nan')):+.1f}%  "
           f"pressure_dp vs cpu={res.get('pressure_dp_vs_cpu_pct', float('nan')):+.1f}%", flush=True)

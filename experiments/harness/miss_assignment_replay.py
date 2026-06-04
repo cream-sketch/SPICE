@@ -13,6 +13,7 @@ No quality changes; all routed experts are computed. This is not an upstream bas
 from __future__ import annotations
 
 import argparse
+import bisect
 import glob
 import json
 from collections import defaultdict
@@ -72,7 +73,7 @@ def load_sequences(trace_dir: str):
     return seqs, int(n_layers), int(n_experts), int(top_k)
 
 
-def load_costs(path: str):
+def load_costs(path: str, metric: str = "ms"):
     data = json.loads(Path(path).read_text())
     rows = data["rows"]
     table = {}
@@ -80,7 +81,9 @@ def load_costs(path: str):
     for r in rows:
         n = int(r["n_miss"])
         f = int(r["n_fetch"])
-        table[(n, f)] = float(r["ms"])
+        if metric not in r:
+            raise KeyError(f"{path} row is missing requested cost metric {metric!r}")
+        table[(n, f)] = float(r[metric])
     for n in sorted({int(r["n_miss"]) for r in rows}):
         choices = [(f, table[(n, f)]) for f in range(n + 1)]
         best[n] = min(choices, key=lambda x: x[1])[0]
@@ -171,10 +174,8 @@ def build_future_positions(seq):
 
 def oracle_next_use(fut, key, ti: int):
     arr = fut.get(key, [])
-    for x in arr:
-        if x > ti:
-            return x
-    return 10**12
+    idx = bisect.bisect_right(arr, ti)
+    return arr[idx] if idx < len(arr) else 10**12
 
 
 def select_fetch(policy: str, misses: list[int], l: int, tid: int, ti: int, pop, future_tbl, future_marg,
@@ -214,7 +215,7 @@ def layer_time_ms(dense_ms: float, hit_count: int, miss_cost_ms: float, t_gpu: f
     return dense_ms + max(hit_gpu, miss_cost_ms)
 
 
-def simulate(seq, n_layers, n_experts, capacity, policy, cost_table, best_table, pop,
+def simulate(seq, fut, n_layers, n_experts, capacity, policy, cost_table, best_table, pop,
              future_tbl, future_marg, expert_mb, act_roundtrip_mb, args):
     cache = warm_cache(pop, capacity)
     last_used = {k: 0 for k in cache}
@@ -225,7 +226,6 @@ def simulate(seq, n_layers, n_experts, capacity, policy, cost_table, best_table,
     admitted_used = 0
     admitted_never_used = 0
     admitted_live = {}  # key -> used?
-    fut = build_future_positions(seq)
     pos = 0
     for ti, (tid, per_layer) in enumerate(seq):
         for l, topk in enumerate(per_layer):
@@ -312,6 +312,7 @@ def main() -> None:
     cost_table, best_table, cost_meta, expert_mb, act_roundtrip_mb = load_costs(args.cost_json)
     pop = popularity(train, n_layers, n_experts)
     future_tbl, future_marg = future_demand(train, n_layers, n_experts, args.alpha)
+    test_futures = [build_future_positions(s) for s in test]
     policies = [x.strip() for x in args.policies.split(",") if x.strip()]
     residencies = [float(x) for x in args.residency.split(",")]
     rows = []
@@ -324,8 +325,8 @@ def main() -> None:
         cap = max(1, int(round(r * n_layers * n_experts)))
         for pol in policies:
             agg = defaultdict(float)
-            for s in test:
-                res = simulate(s, n_layers, n_experts, cap, pol, cost_table, best_table, pop,
+            for s, fut in zip(test, test_futures):
+                res = simulate(s, fut, n_layers, n_experts, cap, pol, cost_table, best_table, pop,
                                future_tbl, future_marg, expert_mb, act_roundtrip_mb, args)
                 for k, v in res.items():
                     agg[k] += v
