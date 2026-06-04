@@ -133,6 +133,9 @@ def parse_args() -> argparse.Namespace:
                    help="one-time cost charged to each resident admission (main-stream D2D promotion copy + "
                         "low-stream fence/opportunity cost). Subtracted from oracle_value before the margin test; "
                         "sweep this to reflect measured promotion overhead.")
+    p.add_argument("--allow_train_eval_fallback", action="store_true",
+                   help="diagnostic smoke-test escape hatch: when the held-out split is empty, reuse all sequences "
+                        "as test. Do not use for paper evidence.")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -224,12 +227,17 @@ class ShallowIssuer:
         # only a best-effort hint for residual demand copies.
         self.high_stream = torch.cuda.Stream(device=dev, priority=-1)
         self.free_low = deque(range(len(low_slots)))
-        self.active_low = []  # dict(event,key,slot,target_token,target_layer,expired)
+        self.active_low = []  # dict(event,key,slot,target_token,target_layer,expired,pending_live)
         self.staged = {}      # key -> dict(slot,target_token,target_layer)
         self.intents = deque()
         self.pending = set()
         self.high_rr = 0
         self.stats = defaultdict(float)
+
+    def _release_pending(self, item):
+        if item.get("pending_live", False):
+            item["pending_live"] = False
+            self.pending.discard(item["key"])
 
     def hkey(self, key):
         layer, expert = key
@@ -257,7 +265,7 @@ class ShallowIssuer:
         kept = deque()
         for item in self.intents:
             if self.expired(item, ti, layer):
-                self.pending.discard(item["key"])
+                self._release_pending(item)
                 self.stats["prefetch_intent_expired"] += 1
             else:
                 kept.append(item)
@@ -266,12 +274,12 @@ class ShallowIssuer:
         for key, item in list(self.staged.items()):
             if self.expired(item, ti, layer):
                 self.staged.pop(key, None)
-                self.pending.discard(key)
                 self.release_low_slot(item["slot"])
                 self.stats["prefetch_staged_expired"] += 1
 
         for item in self.active_low:
             if self.expired(item, ti, layer):
+                self._release_pending(item)
                 item["expired"] = True
 
     def poll(self, ti=None, layer=None):
@@ -280,7 +288,7 @@ class ShallowIssuer:
         kept = []
         for item in self.active_low:
             if item["event"].query():
-                self.pending.discard(item["key"])
+                self._release_pending(item)
                 if item.get("expired", False):
                     self.release_low_slot(item["slot"])
                     self.stats["prefetch_completed_expired"] += 1
@@ -313,7 +321,12 @@ class ShallowIssuer:
     def add_intent(self, key, target_token, target_layer, resident_or_staged):
         if key in resident_or_staged or key in self.pending:
             return
-        self.intents.append({"key": key, "target_token": target_token, "target_layer": target_layer})
+        self.intents.append({
+            "key": key,
+            "target_token": target_token,
+            "target_layer": target_layer,
+            "pending_live": True,
+        })
         self.pending.add(key)
         self.stats["prefetch_intents"] += 1
 
@@ -336,6 +349,7 @@ class ShallowIssuer:
                 "target_token": item["target_token"],
                 "target_layer": item["target_layer"],
                 "expired": False,
+                "pending_live": item.get("pending_live", False),
             })
             self.stats["prefetch_submitted"] += 1
 
@@ -343,7 +357,6 @@ class ShallowIssuer:
         self.poll()
         item = self.staged.pop(key, None)
         if item is not None:
-            self.pending.discard(key)
             self.stats["prefetch_useful"] += 1
             return item["slot"], self.low_slots[item["slot"]]
         return None
@@ -353,12 +366,17 @@ class ShallowIssuer:
             if item["key"] == key:
                 if item.get("expired", False):
                     self.stats["prefetch_wait_active_expired"] += 1
-                    return None
+                    # The CUDA copy cannot be cancelled once submitted, but it
+                    # has missed its logical deadline.  Drop pending membership
+                    # now so a future target may re-issue this key; poll() will
+                    # release this low slot when the old copy completes.
+                    self._release_pending(item)
+                    continue
                 t0 = time.perf_counter()
                 item["event"].synchronize()
                 self.stats["prefetch_waited_active_ms"] += (time.perf_counter() - t0) * 1000.0
                 self.active_low.pop(i)
-                self.pending.discard(key)
+                self._release_pending(item)
                 self.stats["prefetch_useful"] += 1
                 self.stats["prefetch_waited_active"] += 1
                 return item["slot"], self.low_slots[item["slot"]]
@@ -369,12 +387,12 @@ class ShallowIssuer:
         removed = 0
         for item in self.intents:
             if item["key"] == key:
+                self._release_pending(item)
                 removed += 1
             else:
                 kept.append(item)
         if removed:
             self.intents = kept
-            self.pending.discard(key)
             self.stats["prefetch_intent_cancelled"] += removed
 
     def fetch_residual_async(self, keys):
@@ -538,13 +556,11 @@ def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: S
             stats["gos_targets"] += 1
             stats["gos_backlog_copies"] += backlog0
             stats["gos_slot_reserved"] += reserved0
-        options, info = gos_target_options(ranked, resident_or_staged, reserved0, backlog0, low_slots, lead,
-                                           cost_table, t_fetch, t_gpu, args, stats)
         deadline_copies = int((lead * args.gos_layer_slack_ms) // t_fetch) if t_fetch > 0 else low_slots
         targets.append({
             "target": target,
-            "options": options,
-            "info": info,
+            "ranked": ranked,
+            "lead": lead,
             "deadline_copies": deadline_copies,
         })
 
@@ -555,20 +571,25 @@ def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: S
     for idx, target in enumerate(targets):
         next_dp = {}
         for (used_copies, used_keys), (value, path) in dp.items():
-            for option in target["options"]:
+            ranked = [k for k in target["ranked"] if k not in used_keys]
+            options, info = gos_target_options(
+                ranked, resident_or_staged, reserved0 + used_copies, backlog0 + used_copies,
+                low_slots, target["lead"], cost_table, t_fetch, t_gpu, args, stats
+            )
+            for option in options:
                 option_keys = frozenset(option["keys"])
                 if option_keys & used_keys:
                     continue
                 nc = used_copies + option["f"]
                 if reserved0 + nc > low_slots:
                     continue
-                if backlog0 + nc > target["deadline_copies"]:
+                if option["f"] > 0 and backlog0 + nc > target["deadline_copies"]:
                     continue
                 nv = value + option["value"]
                 state = (nc, used_keys | option_keys)
                 old = next_dp.get(state)
                 if old is None or nv > old[0]:
-                    next_dp[state] = (nv, path + [(idx, option)])
+                    next_dp[state] = (nv, path + [(idx, option, info)])
         dp = next_dp or {(0, frozenset()): (0.0, [])}
         if stats is not None:
             stats["gos_dp_states"] += len(dp)
@@ -577,12 +598,13 @@ def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: S
         (_best_copies, _best_keys), (best_value, best_path) = max(dp.items(), key=lambda x: (x[1][0], -x[0][0]))
     else:
         best_value, best_path = 0.0, []
-    selected = {idx: option for idx, option in best_path if option["f"] > 0}
+    chosen = {idx: (option, info) for idx, option, info in best_path}
+    selected = {idx: option for idx, (option, _info) in chosen.items() if option["f"] > 0}
     admitted = []
     for idx, target in enumerate(targets):
         option = selected.get(idx)
         if option is None:
-            info = target["info"]
+            _zero, info = chosen.get(idx, ({"f": 0, "value": 0.0, "keys": []}, {"empty": True}))
             if info["empty"]:
                 continue
             if stats is not None:
@@ -657,10 +679,14 @@ def main() -> None:
     # priors (and, for oracle_value admission, true future routes) into evaluation.
     train, test = seqs[:split], seqs[split:]
     if not test:
-        raise ValueError(
-            f"empty held-out test split (len(seqs)={len(seqs)}, train_frac={args.train_frac}); "
-            "need seqs[split:] non-empty for a valid train/test separation"
-        )
+        if args.allow_train_eval_fallback:
+            test = seqs
+        else:
+            raise ValueError(
+                f"empty held-out test split (len(seqs)={len(seqs)}, train_frac={args.train_frac}); "
+                "need seqs[split:] non-empty for a valid train/test separation, or pass "
+                "--allow_train_eval_fallback for smoke tests only"
+            )
     pop = popularity([seq_for_popularity(x) for x in train], n_layers, n_experts)
     cap = max(1, int(round(args.residency * n_layers * n_experts)))
 
