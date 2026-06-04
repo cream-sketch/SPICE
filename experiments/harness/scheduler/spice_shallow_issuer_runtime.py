@@ -129,6 +129,10 @@ def parse_args() -> argparse.Namespace:
                    help="true-future token horizon for --prefetch_hit_admission=oracle_value")
     p.add_argument("--resident_value_margin_ms", type=float, default=0.25,
                    help="oracle resident admission requires future saved critical-path value above this margin")
+    p.add_argument("--resident_admit_cost_ms", type=float, default=0.0,
+                   help="one-time cost charged to each resident admission (main-stream D2D promotion copy + "
+                        "low-stream fence/opportunity cost). Subtracted from oracle_value before the margin test; "
+                        "sweep this to reflect measured promotion overhead.")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -648,7 +652,15 @@ def main() -> None:
     if args.high_slots < args.top_k:
         raise ValueError(f"--high_slots={args.high_slots} must be >= --top_k={args.top_k}")
     split = max(1, int(round(len(seqs) * args.train_frac)))
-    train, test = seqs[:split], seqs[split:] or seqs
+    # Fail-fast: a non-empty HELD-OUT test split is required. The old `seqs[split:] or seqs`
+    # fallback silently reused the TRAIN sequences as test, leaking popularity/warm-cache
+    # priors (and, for oracle_value admission, true future routes) into evaluation.
+    train, test = seqs[:split], seqs[split:]
+    if not test:
+        raise ValueError(
+            f"empty held-out test split (len(seqs)={len(seqs)}, train_frac={args.train_frac}); "
+            "need seqs[split:] non-empty for a valid train/test separation"
+        )
     pop = popularity([seq_for_popularity(x) for x in train], n_layers, n_experts)
     cap = max(1, int(round(args.residency * n_layers * n_experts)))
 
@@ -776,17 +788,24 @@ def main() -> None:
                 stats[f"{source}_admit_rejected"] += 1
 
         def oracle_value_admit(key, cur_layer, true_top, ti):
+            # OPTIMISTIC oracle upper-bound on resident-admission value (NOT a deployable model).
+            # Per future hit, the no-residency fallback is policy/forecast dependent: re-stage via a
+            # low-slot H2D copy (if LoRE re-predicts it), residual high-fetch, or CPU serve. We credit
+            # the FULL H2D transfer (t_fetch) as saved -- an UPPER bound, since a well-overlapped low
+            # stream hides part of that transfer so the true EXPOSED saving is <= t_fetch (the harness
+            # has no per-key exposed-wait column to measure it exactly). GPU compute (t_gpu) is paid in
+            # BOTH the resident and the re-stage case, so it cancels. Admitting also pays a one-time
+            # main-stream D2D promotion + low-stream fence (resident_admit_cost_ms, sweep it) and evicts
+            # a victim whose own future hits then re-stage. Interpretation: if even this optimistic
+            # ceiling cannot beat never-admit, resident admission is robustly not worth it.
             victim = ls_victim(cur_layer)
             cand_hits = count_future_hits(true_top, key, ti)
             victim_hits = 0 if victim is None else count_future_hits(true_top, victim, ti)
-            cpu1 = measured_cpu_cost_ms(1, cost_table)
-            saved_per_hit = max(0.0, (cpu1 if cpu1 is not None else 0.0) - t_gpu)
-            value_ms = (cand_hits - victim_hits) * saved_per_hit
+            saved_per_hit = t_fetch  # H2D re-stage avoided per future resident hit
+            value_ms = (cand_hits - victim_hits) * saved_per_hit - args.resident_admit_cost_ms
             stats["resident_admit_oracle_cand_hits"] += cand_hits
             stats["resident_admit_oracle_victim_hits"] += victim_hits
             stats["resident_admit_oracle_value_ms"] += value_ms
-            if victim is None:
-                return cand_hits * saved_per_hit >= args.resident_value_margin_ms
             return value_ms >= args.resident_value_margin_ms
 
         def resolve_resident_admission_policy(source):
