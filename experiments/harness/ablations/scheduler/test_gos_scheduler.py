@@ -6,7 +6,7 @@ import sys
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import spice_shallow_issuer_runtime as rt
+import resident_admission_runtime as rt  # full runtime (with DP + resident admission) lives in ablations/
 
 
 class FakeIssuer:
