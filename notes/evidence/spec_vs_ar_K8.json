@@ -1,0 +1,48 @@
+{
+  "windows": "../../notes/evidence/p1_windows_K8.pt",
+  "cost": "../../notes/evidence/miss_assign_ext_n24_bf16.json",
+  "L": 24,
+  "E": 60,
+  "top_k": 4,
+  "rows": [
+    {
+      "residency": 0.05,
+      "capacity": 72,
+      "K": 8,
+      "tokens_per_step": 3.0357615894039736,
+      "ar_fiddler_cpu_per_tok_ms": 29.06327562114441,
+      "ar_split_per_tok_ms": 28.48649116528507,
+      "ar_fetchall_per_tok_ms": 73.94539098255595,
+      "spec_split_per_tok_ms": 44.17110313683318,
+      "spec_cpu_per_tok_ms": 49.9142540200386,
+      "spec_vs_ar_split_ratio": 1.5505982425333622,
+      "spec_vs_ar_fiddler_ratio": 1.519825353226784
+    },
+    {
+      "residency": 0.1,
+      "capacity": 144,
+      "K": 8,
+      "tokens_per_step": 3.0357615894039736,
+      "ar_fiddler_cpu_per_tok_ms": 27.328402775154085,
+      "ar_split_per_tok_ms": 26.411734696060485,
+      "ar_fetchall_per_tok_ms": 68.58490120409044,
+      "spec_split_per_tok_ms": 41.05091569007411,
+      "spec_cpu_per_tok_ms": 47.04621609541121,
+      "spec_vs_ar_split_ratio": 1.5542680616202456,
+      "spec_vs_ar_fiddler_ratio": 1.5021337334575586
+    },
+    {
+      "residency": 0.2,
+      "capacity": 288,
+      "K": 8,
+      "tokens_per_step": 3.0357615894039736,
+      "ar_fiddler_cpu_per_tok_ms": 23.877531501847123,
+      "ar_split_per_tok_ms": 22.760004729831486,
+      "ar_fetchall_per_tok_ms": 58.613313252820575,
+      "spec_split_per_tok_ms": 35.15060437746182,
+      "spec_cpu_per_tok_ms": 40.439002857588626,
+      "spec_vs_ar_split_ratio": 1.5444023318409068,
+      "spec_vs_ar_fiddler_ratio": 1.4721205320048527
+    }
+  ]
+}

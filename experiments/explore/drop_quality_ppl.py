@@ -10,7 +10,9 @@ from pathlib import Path
 import torch, torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-DROP_N = 0  # 全局: 丢弃 routing_weights 最低的 DROP_N 个 routed 专家
+DROP_N = 0       # 全局: 丢弃 DROP_N 个 routed 专家 / global: number of routed experts to drop
+SELECT = "lowest"  # 选择方式: lowest=最低gate(controller), random=随机, highest=最高gate(对照上界)
+                   # selection: lowest gate (the controller), random, or highest gate (adversarial bound)
 
 def patched_moe_forward(mlp, hidden_states):
     b, s, d = hidden_states.shape
@@ -22,8 +24,18 @@ def patched_moe_forward(mlp, hidden_states):
         rw = rw / rw.sum(dim=-1, keepdim=True)
     rw = rw.to(h.dtype)
     if DROP_N > 0:
-        # 置零最低 DROP_N 个 rank 的权重 (topk 已降序, 最后 DROP_N 列最低)
-        rw = rw.clone(); rw[:, mlp.top_k - DROP_N:] = 0.0
+        # 置零选中专家的权重 (topk 已降序: 列 0=最高 gate, 末列=最低 gate)
+        # zero the selected experts' weights (topk descending: col 0 = highest gate, last = lowest)
+        rw = rw.clone()
+        if SELECT == "lowest":
+            rw[:, mlp.top_k - DROP_N:] = 0.0
+        elif SELECT == "highest":
+            rw[:, :DROP_N] = 0.0
+        elif SELECT == "random":
+            perm = torch.argsort(torch.rand(rw.shape[0], mlp.top_k, device=rw.device), dim=1)
+            rw.scatter_(1, perm[:, :DROP_N], 0.0)
+        else:
+            raise ValueError(SELECT)
     final = torch.zeros((b * s, d), dtype=h.dtype, device=h.device)
     mask = F.one_hot(sel, num_classes=mlp.num_experts).permute(2, 1, 0)
     for ei in range(mlp.num_experts):
@@ -52,7 +64,7 @@ def ppl(model, tok, texts, device, max_len):
     return math.exp(nll / max(1, ntok))
 
 def main():
-    global DROP_N
+    global DROP_N, SELECT
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_dir", required=True)
     ap.add_argument("--text_file", required=True)
@@ -61,7 +73,10 @@ def main():
     ap.add_argument("--max_samples", type=int, default=40)
     ap.add_argument("--max_len", type=int, default=256)
     ap.add_argument("--drops", type=str, default="0,1,2,3")
+    ap.add_argument("--select", choices=["lowest", "random", "highest"], default="lowest",
+                    help="which experts to drop: lowest gate (controller), random, or highest gate (bound)")
     args = ap.parse_args()
+    SELECT = args.select
     device = torch.device(f"cuda:{args.gpu}")
     tok = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(args.model_dir, torch_dtype=torch.bfloat16,
@@ -76,7 +91,7 @@ def main():
     for dn in [int(x) for x in args.drops.split(",")]:
         DROP_N = dn
         res[f"drop_{dn}"] = ppl(model, tok, texts, device, args.max_len)
-        print(f"DROP_N={dn} (drop lowest {dn} of top-4 routed) PPL={res[f'drop_{dn}']:.4f}")
+        print(f"DROP_N={dn} select={SELECT} PPL={res[f'drop_{dn}']:.4f}")
     base = res.get("drop_0", 1.0)
     res_rel = {k: (v/base - 1.0)*100 for k, v in res.items()}
     out = {"ppl": res, "ppl_rel_pct_vs_full": res_rel}
