@@ -1,0 +1,15 @@
+{
+  "files": [
+    "fc_00000.pt",
+    "fc_00001.pt",
+    "fc_00002.pt",
+    "fc_00003.pt",
+    "fc_00004.pt",
+    "fc_00005.pt",
+    "fc_00006.pt",
+    "fc_00007.pt"
+  ],
+  "top_k": 4,
+  "max_horizon": 6,
+  "model_dir": "/data/Models/Qwen1.5-MoE-A2.7"
+}

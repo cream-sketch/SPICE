@@ -23,6 +23,10 @@ Policies:
                         residual misses all CPU-served.
   shallow_scheduler   : shallow issuer + per-layer resource split between
                         residual H2D fetch and CPU service.
+  deep_dummy_cpu /
+  shallow_dummy_cpu   : same forecast traffic as deep/shallow, but prefetched
+                        experts are not consumed as hits; this keeps miss counts
+                        identical and isolates copy-queue interference.
 
 The key question is whether a real software issuer that limits submitted low
 H2D depth can preserve SPICE prefetch utility without letting draft traffic
@@ -287,7 +291,9 @@ class ShallowIssuer:
     def wait_active(self, key):
         for i, item in enumerate(self.active_low):
             if item["key"] == key:
+                t0 = time.perf_counter()
                 item["event"].synchronize()
+                self.stats["prefetch_waited_active_ms"] += (time.perf_counter() - t0) * 1000.0
                 self.active_low.pop(i)
                 self.pending.discard(key)
                 self.stats["prefetch_waited_active"] += 1
@@ -325,7 +331,9 @@ class ShallowIssuer:
 
     def wait_high(self, fetches):
         if fetches:
+            t0 = time.perf_counter()
             fetches[-1]["event"].synchronize()
+            self.stats["residual_fetch_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
     def flush(self):
         torch.cuda.synchronize(self.dev)
@@ -335,12 +343,16 @@ class ShallowIssuer:
 def choose_fetch_count(nmiss: int, active_low: int, cost_table, t_fetch: float, fetch_margin_ms: float) -> int:
     if nmiss <= 0:
         return 0
-    all_cpu = cost_table[(nmiss, 0)]
+    all_cpu = cost_table.get((nmiss, 0))
+    if all_cpu is None:
+        return 0
     best_cost = all_cpu
     best_fetch = 0
     h2d_wait = active_low * t_fetch
     for nf in range(1, nmiss + 1):
-        measured = cost_table[(nmiss, nf)]
+        measured = cost_table.get((nmiss, nf))
+        if measured is None:
+            continue
         # The split microbench does not include already-submitted low-prefetch
         # head-of-line wait, nor the runtime's admission/event overhead. Require
         # a real margin before choosing residual H2D; thin wins disappeared in
@@ -449,6 +461,7 @@ def main() -> None:
 
     def run_policy(policy: str):
         max_depth = None if policy.startswith("deep_") else args.shallow_depth
+        ignore_prefetch_hits = "dummy" in policy
         issuer = ShallowIssuer(dev, host_bank, low_slots, high_slots, bank_size, max_depth=max_depth)
         cache = warm_cache(pop, cap)
         resident_map, free_resident = setup_resident(cache)
@@ -521,15 +534,16 @@ def main() -> None:
                             last_used[key] = pos
                             stats["hits"] += 1
                         else:
-                            staged = issuer.pop_staged(key)
+                            staged = None if ignore_prefetch_hits else issuer.pop_staged(key)
                             if staged is None:
-                                staged = issuer.wait_active(key)
+                                staged = None if ignore_prefetch_hits else issuer.wait_active(key)
                             if staged is not None:
                                 slot_id, slot = staged
                                 hit_items.append((key, slot_id, slot, True))
                                 stats["hits"] += 1
                             else:
-                                issuer.cancel_intent(key)
+                                if not ignore_prefetch_hits:
+                                    issuer.cancel_intent(key)
                                 misses.append(key)
                                 stats["misses"] += 1
                         pos += 1
@@ -601,14 +615,17 @@ def main() -> None:
         for k in ["routed", "hits", "misses", "residual_fetches", "cpu_served", "cache_evictions",
                   "prefetch_intents", "prefetch_submitted", "prefetch_completed", "prefetch_useful",
                   "prefetch_waited_active", "prefetch_intent_cancelled", "prefetch_intent_expired",
-                  "prefetch_staged_expired", "prefetch_completed_expired"]:
+                  "prefetch_staged_expired", "prefetch_completed_expired",
+                  "prefetch_waited_active_ms", "residual_fetch_wait_ms"]:
             row[f"{k}_per_tok"] = row.get(k, 0.0) / max(1, row["tokens"])
         rows.append(row)
         print(f"{policy:18s} TPOT={row['tpot_ms_median']:8.3f} "
               f"hit/tok={row['hits_per_tok']:6.2f} miss/tok={row['misses_per_tok']:6.2f} "
               f"fb_fetch/tok={row['residual_fetches_per_tok']:6.2f} cpu/tok={row['cpu_served_per_tok']:6.2f} "
               f"pf_sub/tok={row['prefetch_submitted_per_tok']:6.2f} pf_use/tok={row['prefetch_useful_per_tok']:6.2f} "
-              f"pf_wait/tok={row['prefetch_waited_active_per_tok']:6.2f}",
+              f"pf_wait/tok={row['prefetch_waited_active_per_tok']:6.2f} "
+              f"pf_wait_ms/tok={row['prefetch_waited_active_ms_per_tok']:6.2f} "
+              f"resid_wait_ms/tok={row['residual_fetch_wait_ms_per_tok']:6.2f}",
               flush=True)
 
     by = {r["policy"]: r for r in rows}
