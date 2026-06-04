@@ -27,3 +27,4 @@ env/
 notes/codex_run_*.log
 
 notes/codex_review_*.log
+ref_repo/

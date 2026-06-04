@@ -1,0 +1,8 @@
+The quick brown fox writes a systems paper about GPU memory, CPU fallback, and expert prefetch scheduling.
+A database engineer explains why asynchronous copy queues can cause head-of-line blocking in a single request.
+During inference, a small routing model predicts future experts while the target model verifies every decision.
+Hardware measurements are necessary because optimistic overlap models hide PCIe serialization and CPU synchronization.
+Capacity-aware scheduling decides whether a missed expert should be fetched to HBM or computed on the CPU.
+The benchmark separates information quality from execution policy so that each resource bottleneck is visible.
+A reliable paper must compare against source-only baselines and report diagnostic harness limitations clearly.
+Single-stream decoding leaves little batch reuse, so the scheduler must coordinate HBM, DRAM, PCIe, CPU, and GPU.

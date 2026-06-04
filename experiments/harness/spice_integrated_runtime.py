@@ -71,6 +71,10 @@ def parse_args():
     ap.add_argument("--out", required=True)
     ap.add_argument("--cpu_dtype", choices=["bf16", "fp32"], default="bf16")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--filler_compute_dim", type=int, default=0,
+                    help="if >0, run a REAL [dim,dim]x[dim,dim] matmul per layer on the MAIN stream to create a "
+                         "realistic per-layer COMPUTE WINDOW (models heavier model / weaker GPU where compute~PCIe). "
+                         "Prefetch H2D overlaps this window; lets the real runtime expose SPICE's overlap benefit. 0=A800-native.")
     return ap.parse_args()
 
 
@@ -85,7 +89,8 @@ def main():
     # controller: which top-k ranks (0=highest gate weight) to shared-expert-substitute when residual-missed
     substitute_ranks = set(int(x) for x in a.substitute_ranks.split(",") if x.strip() != "")
     policies = [x.strip() for x in a.policies.split(",") if x.strip()]
-    valid_policies = {"prefetch_sync", "prefetch_cpu", "prefetch_capacity", "prefetch_pressure_dp", "prefetch_controller"}
+    valid_policies = {"no_prefetch", "prefetch_sync", "prefetch_cpu", "prefetch_capacity",
+                      "prefetch_pressure_dp", "prefetch_controller"}
     unknown = sorted(set(policies) - valid_policies)
     if unknown:
         raise ValueError(f"unknown policies: {unknown}")
@@ -148,6 +153,17 @@ def main():
     def expert_cpu(hc, l, e):
         g, u, d = cpu_bank[hkey(l, e)]
         return F.linear(F.silu(F.linear(hc, g)) * F.linear(hc, u), d)
+
+    # REAL per-layer compute window (filler matmul) to model heavier-model / weaker-GPU regime where
+    # compute ~ PCIe, so SPICE's prefetch overlap can hide transfers. fcd=0 -> A800-native (tiny compute).
+    fcd = a.filler_compute_dim
+    filler_a = torch.randn(fcd, fcd, device=dev, dtype=dt) if fcd > 0 else None
+    filler_b = torch.randn(fcd, fcd, device=dev, dtype=dt) if fcd > 0 else None
+
+    def filler_compute():
+        if filler_a is not None:
+            return (filler_a @ filler_b).sum()  # real GPU matmul on the main stream (a compute window)
+        return None
 
     # ---- routing trace ----
     if a.trace_dir == "synthetic":
@@ -284,7 +300,8 @@ def main():
         # controller substitutes low-gate-mass (high-rank) slots: skip BOTH prefetch H2D AND serve,
         # relying on the always-on shared expert. This removes their PCIe traffic -> lowers the floor.
         do_sub = (policy == "prefetch_controller")
-        serve_policy = "prefetch_cpu" if policy == "prefetch_controller" else policy
+        no_pf = (policy == "no_prefetch")  # on-demand baseline: EVERY routed expert sync-fetched, no prefetch
+        serve_policy = "prefetch_sync" if no_pf else ("prefetch_cpu" if policy == "prefetch_controller" else policy)
         torch.cuda.synchronize(dev)
         t0 = time.perf_counter()
         for ti in range(T):
@@ -302,6 +319,7 @@ def main():
                 hn = h
                 _ = F.linear(hn, Wrt[l])
                 out = shared(l, hn)
+                filler_compute()  # REAL per-layer compute window (prefetch H2D overlaps this on pf_stream)
                 residual = []
                 for e, rank, is_resid in slot_info[ti][l]:
                     if do_sub and rank in substitute_ranks:
@@ -309,10 +327,13 @@ def main():
                         # substituted HIT saves a prefetch H2D (PCIe, the bottleneck); residual saves CPU serve.
                         sub_stats[1 if is_resid else 0] += 1
                         continue
-                    if is_resid:
+                    if no_pf:
+                        # on-demand baseline: this slot (hit OR residual) is sync-fetched on the critical path
+                        residual.append((e, rank))
+                    elif is_resid:
                         residual.append((e, rank))
                     else:
-                        # hit: GPU GEMM + SPICE prefetch H2D traffic (overlapped on low-pri stream)
+                        # hit: GPU GEMM + SPICE prefetch H2D traffic (overlapped on low-pri stream, hides behind compute)
                         out = out + expert_gpu(resident_w, hn)
                         with torch.cuda.stream(pf_stream):
                             for s, dd in zip(host_bank[hkey(l, e)], pf_stage):
