@@ -1,10 +1,14 @@
-"""Build a forecast dump (true_top + placeholder fcast) from decode routing traces.
+"""Build a forecast dump (true_top + fcast) from decode routing traces.
 
 从 decode 路由 trace 构造 forecast dump (true_top 真实 + fcast 占位).
 For depth=0 negative-admission runs the fcast is unused; only true_top (gate-descending
 top-k routing) drives residual misses. Lets the shallow runtime run on models that have
 decode traces but no draft-forecast dump (e.g. DeepSeek-V2-Lite).
-仅 true_top 用于 depth=0; fcast 占位 (-1).
+
+By default fcast is a placeholder (-1).  With --oracle_future_fcast, fcast[l, lead, t]
+is filled with the true top-k experts at layer l+lead for the same token t.  This is
+NOT an implementable predictor; it is a resource-scheduler upper bound used to separate
+"can the hardware scheduler help if predictions are perfect?" from draft accuracy.
 """
 import argparse, glob, json
 from pathlib import Path
@@ -18,6 +22,8 @@ def main():
     ap.add_argument("--max_horizon", type=int, default=6)
     ap.add_argument("--max_files", type=int, required=True)
     ap.add_argument("--model_dir", default="deepseek-v2-lite")
+    ap.add_argument("--oracle_future_fcast", action="store_true",
+                    help="fill fcast with same-token future true routes; upper-bound only, not a real predictor")
     args = ap.parse_args()
     files = sorted(glob.glob(str(Path(args.trace_dir) / "dec_*.pt")))[: args.max_files]
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
@@ -34,14 +40,23 @@ def main():
         for t, (_tid, per_layer) in enumerate(steps):
             for l in range(L):
                 true_top[l, t] = torch.tensor([int(e) for e in per_layer[l]][:K], dtype=torch.long)
-        fcast = torch.full((L, args.max_horizon, T, K), -1, dtype=torch.long)  # placeholder (unused at depth=0)
+        fcast = torch.full((L, args.max_horizon, T, K), -1, dtype=torch.long)
+        if args.oracle_future_fcast:
+            for l in range(L):
+                for lead in range(args.max_horizon):
+                    target_l = l + lead
+                    if target_l < L:
+                        fcast[l, lead] = true_top[target_l]
         name = f"fc_{i:05d}.pt"
         torch.save({"true_top": true_top, "fcast": fcast, "num_layers": L,
                     "top_k": K, "max_horizon": args.max_horizon}, out / name)
         names.append(name)
+    note = ("true_top from decode traces; fcast is oracle same-token future true routes; "
+            "upper-bound only, not an implementable draft predictor") if args.oracle_future_fcast else (
+            "true_top from decode traces; fcast placeholder (-1), valid only for depth=0 runs")
     (out / "manifest.json").write_text(json.dumps(
         {"files": names, "top_k": K, "max_horizon": args.max_horizon, "model_dir": args.model_dir,
-         "note": "true_top from decode traces; fcast placeholder (-1), valid only for depth=0 runs"}, indent=2))
+         "oracle_future_fcast": bool(args.oracle_future_fcast), "note": note}, indent=2))
     print(f"[done] wrote {len(names)} forecast files (L={L}, K={K}) -> {out}")
 
 
