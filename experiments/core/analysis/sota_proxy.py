@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys, pathlib  # bootstrap: resolve sibling core modules regardless of CWD
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from common import build_arg_parser, device_from_arg, ensure_dir, measure_gpu_power_watts, set_seed, write_json
 from prefetch_system_sim import SimConfig, make_trace, measure_copy_bandwidth, simulate_policy

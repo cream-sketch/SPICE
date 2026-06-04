@@ -14,7 +14,7 @@ echo "GPU=$GPU"
 echo "PY=$PY"
 date
 
-"$PY" train_draft_model.py \
+"$PY" draft/train_draft_model.py \
   --gpu "$GPU" \
   --out_dir "$ROOT/train" \
   --layers 8 \
@@ -34,7 +34,7 @@ date
   --align_lambda 0.1 \
   --log_every 100
 
-"$PY" eval_draft_prefetch.py \
+"$PY" draft/eval_draft_prefetch.py \
   --gpu "$GPU" \
   --out_dir "$ROOT/eval" \
   --checkpoint "$ROOT/train/spice_draft.pt" \
