@@ -1,5 +1,21 @@
 # ARCHIVE_INDEX — explore/ (archived experiments)
 
+## 2026-06-03 cleanup (tier B) — explore/ retired
+Repo refactor: explore/ scripts were pruned. Conclusions are PRESERVED in git history, tags,
+and the `notes/*verdict*.md` / `notes/codex_*.md` referenced below — only the scripts were removed.
+Recover any deleted script via `git log --all -- experiments/explore/<name>.py`.
+- DELETED (dead/contested/superseded): spice_matrix_microbench/sim, spice_partial_split_microbench/fair,
+  spice_rec_sim, spice_zerocopy_microbench, spice_grouped_cpu_kernel, spice_x_eviction_value/admission, spice_hx_components,
+  token_table_replay, eval_real_trace_eviction/cache_sweep, miss_admission_online, deepseek_miss_admission, cross_token_info,
+  expert_lowrank_spectrum, expert_importance_dist, eval_forecast_eviction, scheduler_killshot, microbatch_multiplex, shared_only_argmax;
+  plus superseded runtimes harness/{spice_integrated_runtime, spice_tiny_runtime, spec_vs_ar_miss_cost}.py.
+- MOVED to harness/ (still-active evidence/characterization): drop_quality_ppl, deepseek_drop_quality,
+  qwen_gate_vs_rank, ds_gate_vs_rank, obs_routing_structure, obs_expert_contribution, obs_cross_expert_structure,
+  token_conditional_analysis, ds_collect_routing.
+The per-file lines below are the original Phase-0 archive record (historical).
+
+---
+
 One line per file moved into `explore/` during the Phase 0 refactor. Verdict tags:
 DEAD = hypothesis killed; CONTESTED = result depends on assumptions / superseded / not
 clearly non-incremental; UTILITY = trace-collection / observation / analysis helper (no verdict).
