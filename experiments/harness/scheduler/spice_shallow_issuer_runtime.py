@@ -101,18 +101,34 @@ def parse_args() -> argparse.Namespace:
                    help="GOS admission margin: CPU critical-path saving must exceed this")
     p.add_argument("--gos_max_prefetch_per_target", type=int, default=4,
                    help="GOS cap on admitted experts per predicted future target layer")
+    p.add_argument("--gos_scheduler", choices=["greedy", "dp"], default="greedy",
+                   help="GOS admission optimizer: greedy preserves old per-target behavior; "
+                        "dp globally optimizes admitted forecast copies under backlog/deadline/slot constraints")
     p.add_argument("--t_gpu_ms", type=float, default=0.079,
                    help="calibrated resident GPU expert compute time used by GOS value model")
     p.add_argument("--no_admit_prefetch_hits", action="store_true",
                    help="serve low-prefetch hits from staging slots and release them without main-stream D2D cache admission")
-    p.add_argument("--prefetch_hit_admission", choices=["always", "never", "hotter_than_victim", "recent_reuse"],
+    p.add_argument("--prefetch_hit_admission",
+                   choices=["always", "never", "hotter_than_victim", "recent_reuse", "oracle_value"],
                    default="always",
                    help="resident-cache promotion policy after a staged prefetch hit is consumed. "
                         "'always' preserves old behavior; 'never' is equivalent to --no_admit_prefetch_hits; "
                         "'hotter_than_victim' promotes only when train popularity beats the LS victim; "
-                        "'recent_reuse' uses online same-layer recent route reuse against the LS victim.")
+                        "'recent_reuse' uses online same-layer recent route reuse against the LS victim; "
+                        "'oracle_value' is a true-future upper-bound kill-test, not deployable.")
+    p.add_argument("--residual_fetch_admission",
+                   choices=["always", "never", "same_as_prefetch", "oracle_value"],
+                   default="always",
+                   help="resident-cache admission after a residual demand fetch. Default preserves old behavior; "
+                        "same_as_prefetch/oracle_value are diagnostics for global HBM admission.")
+    p.add_argument("--allow_oracle_admission", action="store_true",
+                   help="required guard for oracle_value admission policies; marks the run as a true-future upper bound")
     p.add_argument("--admit_recent_window", type=int, default=8,
                    help="token window for --prefetch_hit_admission=recent_reuse")
+    p.add_argument("--admit_value_horizon_tokens", type=int, default=16,
+                   help="true-future token horizon for --prefetch_hit_admission=oracle_value")
+    p.add_argument("--resident_value_margin_ms", type=float, default=0.25,
+                   help="oracle resident admission requires future saved critical-path value above this margin")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -413,17 +429,63 @@ def measured_cpu_cost_ms(nmiss: int, cost_table):
     return None
 
 
-def choose_gos_admissions(candidates_by_target, resident_or_staged, issuer: ShallowIssuer,
-                          cost_table, t_fetch: float, t_gpu: float, args, stats=None):
-    """Global overflow admission over forecast jobs.
+def gos_target_options(ranked, resident_or_staged, reserved: int, backlog: int, low_slots: int, lead: int,
+                       cost_table, t_fetch: float, t_gpu: float, args, stats=None):
+    """Return feasible prefix choices for one future target.
 
-    A target is a future (token, layer).  For each target, SPICE forecasts a set
-    of experts that may miss. GOS submits only the prefix that (1) can complete
-    before the target deadline under the current low-stream backlog and (2)
-    reduces predicted CPU burst more than it costs as future GPU hit compute.
-    This is intentionally conservative: if either the current or post-admission
-    CPU miss burst lacks a measured cost row, the target admits nothing.
+    Option `f=0` is always present.  Positive options are local feasibility
+    candidates; the DP still enforces cumulative deadline/slot feasibility.
     """
+    unique = []
+    seen = set()
+    for key in ranked:
+        if key in seen or key in resident_or_staged:
+            continue
+        seen.add(key)
+        unique.append(key)
+    info = {
+        "unique": unique,
+        "base_unmeasured": False,
+        "slot_feasible": 0,
+        "deadline_feasible": 0,
+        "value_feasible": 0,
+        "unmeasured": False,
+        "empty": False,
+    }
+    options = [{"f": 0, "value": 0.0, "keys": []}]
+    m = len(unique)
+    if m <= 0:
+        info["empty"] = True
+        return options, info
+    base_cpu = measured_cpu_cost_ms(m, cost_table)
+    if base_cpu is None:
+        info["base_unmeasured"] = True
+        return options, info
+    max_f = min(m, args.gos_max_prefetch_per_target)
+    for f in range(1, max_f + 1):
+        if reserved + f > low_slots:
+            continue
+        info["slot_feasible"] += 1
+        finish_ms = (backlog + f) * t_fetch
+        deadline_ms = lead * args.gos_layer_slack_ms
+        if finish_ms > deadline_ms:
+            continue
+        info["deadline_feasible"] += 1
+        after_cpu = measured_cpu_cost_ms(m - f, cost_table)
+        if after_cpu is None:
+            info["unmeasured"] = True
+            continue
+        base_inc = max(0.0, base_cpu - args.gos_cpu_overlap_ms)
+        after_inc = max(f * t_gpu, after_cpu - args.gos_cpu_overlap_ms)
+        value = base_inc - after_inc
+        if value >= args.gos_value_margin_ms:
+            info["value_feasible"] += 1
+            options.append({"f": f, "value": value, "keys": unique[:f]})
+    return options, info
+
+
+def choose_gos_admissions_greedy(candidates_by_target, resident_or_staged, issuer: ShallowIssuer,
+                                 cost_table, t_fetch: float, t_gpu: float, args, stats=None):
     admitted = []
     backlog = issuer.low_backlog_count()
     reserved = issuer.low_reserved_count()
@@ -433,64 +495,23 @@ def choose_gos_admissions(candidates_by_target, resident_or_staged, issuer: Shal
             stats["gos_targets"] += 1
             stats["gos_backlog_copies"] += backlog
             stats["gos_slot_reserved"] += reserved
-        unique = []
-        seen = set()
-        for key in ranked:
-            if key in seen or key in resident_or_staged or key in used:
-                continue
-            seen.add(key)
-            unique.append(key)
-        m = len(unique)
-        if m <= 0:
+        options, info = gos_target_options([k for k in ranked if k not in used], resident_or_staged, reserved,
+                                           backlog, len(issuer.low_slots), lead, cost_table, t_fetch, t_gpu,
+                                           args, stats)
+        best = max(options, key=lambda o: (o["value"], -o["f"]))
+        best_f = best["f"]
+        if info["empty"]:
             continue
-        base_cpu = measured_cpu_cost_ms(m, cost_table)
-        if base_cpu is None:
-            if stats is not None:
-                stats["gos_reject_unmeasured_targets"] += 1
-            continue
-        best_f = 0
-        best_value = 0.0
-        deadline_feasible = 0
-        slot_feasible = 0
-        unmeasured = False
-        max_f = min(m, args.gos_max_prefetch_per_target)
-        for f in range(1, max_f + 1):
-            if reserved + f > len(issuer.low_slots):
-                continue
-            slot_feasible += 1
-            # Active copies and queued intents serialize on the same low-priority
-            # H2D path.  Low-slot capacity is a separate feasibility constraint:
-            # if all staging slots are reserved, this target admits nothing rather
-            # than pretending the copy can be submitted before a slot is released.
-            finish_ms = (backlog + f) * t_fetch
-            deadline_ms = lead * args.gos_layer_slack_ms
-            if finish_ms > deadline_ms:
-                continue
-            deadline_feasible += 1
-            after_cpu = measured_cpu_cost_ms(m - f, cost_table)
-            if after_cpu is None:
-                unmeasured = True
-                continue
-            # Critical-path value, not total-work value.  Without prefetch the
-            # target layer pays only the CPU fallback burst exposed beyond the
-            # non-miss GPU window.  With f prefetched experts, CPU fallback
-            # shrinks, but the main GPU stream now runs f resident expert GEMMs.
-            base_inc = max(0.0, base_cpu - args.gos_cpu_overlap_ms)
-            after_inc = max(f * t_gpu, after_cpu - args.gos_cpu_overlap_ms)
-            value = base_inc - after_inc
-            if value > best_value and value >= args.gos_value_margin_ms:
-                best_f = f
-                best_value = value
         if stats is not None and best_f == 0:
-            if unmeasured:
+            if info["base_unmeasured"] or info["unmeasured"]:
                 stats["gos_reject_unmeasured_targets"] += 1
-            elif slot_feasible == 0:
+            elif info["slot_feasible"] == 0:
                 stats["gos_reject_slot_targets"] += 1
-            elif deadline_feasible == 0:
+            elif info["deadline_feasible"] == 0:
                 stats["gos_reject_deadline_targets"] += 1
             else:
                 stats["gos_reject_value_targets"] += 1
-        for key in unique[:best_f]:
+        for key in best["keys"]:
             admitted.append((key, target_token, target_layer))
             used.add(key)
         backlog += best_f
@@ -498,8 +519,110 @@ def choose_gos_admissions(candidates_by_target, resident_or_staged, issuer: Shal
     return admitted
 
 
+def choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer: ShallowIssuer,
+                             cost_table, t_fetch: float, t_gpu: float, args, stats=None):
+    backlog0 = issuer.low_backlog_count()
+    reserved0 = issuer.low_reserved_count()
+    low_slots = len(issuer.low_slots)
+    targets = []
+    global_seen = set()
+    for target, ranked in sorted(candidates_by_target.items(), key=lambda x: x[0]):
+        target_token, target_layer, lead = target
+        if stats is not None:
+            stats["gos_targets"] += 1
+            stats["gos_backlog_copies"] += backlog0
+            stats["gos_slot_reserved"] += reserved0
+        ranked_unique = []
+        for key in ranked:
+            if key in global_seen:
+                continue
+            ranked_unique.append(key)
+            global_seen.add(key)
+        options, info = gos_target_options(ranked_unique, resident_or_staged, reserved0, backlog0, low_slots, lead,
+                                           cost_table, t_fetch, t_gpu, args, stats)
+        deadline_copies = int((lead * args.gos_layer_slack_ms) // t_fetch) if t_fetch > 0 else low_slots
+        targets.append({
+            "target": target,
+            "options": options,
+            "info": info,
+            "deadline_copies": deadline_copies,
+        })
+
+    # State: cumulative newly admitted H2D copies -> (total value, path).
+    dp = {0: (0.0, [])}
+    for idx, target in enumerate(targets):
+        next_dp = {}
+        for used_copies, (value, path) in dp.items():
+            for option in target["options"]:
+                nc = used_copies + option["f"]
+                if reserved0 + nc > low_slots:
+                    continue
+                if backlog0 + nc > target["deadline_copies"]:
+                    continue
+                nv = value + option["value"]
+                old = next_dp.get(nc)
+                if old is None or nv > old[0] or (nv == old[0] and nc < sum(o["f"] for _i, o in old[1])):
+                    next_dp[nc] = (nv, path + [(idx, option)])
+        dp = next_dp or {0: (0.0, [])}
+        if stats is not None:
+            stats["gos_dp_states"] += len(dp)
+
+    best_value, best_path = max(dp.values(), key=lambda x: (x[0], -sum(o["f"] for _i, o in x[1]))) if dp else (0.0, [])
+    selected = {idx: option for idx, option in best_path if option["f"] > 0}
+    admitted = []
+    for idx, target in enumerate(targets):
+        option = selected.get(idx)
+        if option is None:
+            info = target["info"]
+            if info["empty"]:
+                continue
+            if stats is not None:
+                if info["base_unmeasured"] or info["unmeasured"]:
+                    stats["gos_reject_unmeasured_targets"] += 1
+                elif info["slot_feasible"] == 0:
+                    stats["gos_reject_slot_targets"] += 1
+                elif info["deadline_feasible"] == 0:
+                    stats["gos_reject_deadline_targets"] += 1
+                elif info["value_feasible"] == 0:
+                    stats["gos_reject_value_targets"] += 1
+                else:
+                    stats["gos_reject_global_targets"] += 1
+            continue
+        target_token, target_layer, _lead = target["target"]
+        for key in option["keys"]:
+            admitted.append((key, target_token, target_layer))
+    if stats is not None:
+        stats["gos_dp_selected_value_ms"] += best_value
+        stats["gos_dp_selected_copies"] += len(admitted)
+    return admitted
+
+
+def choose_gos_admissions(candidates_by_target, resident_or_staged, issuer: ShallowIssuer,
+                          cost_table, t_fetch: float, t_gpu: float, args, stats=None):
+    """Global overflow admission over forecast jobs.
+
+    A target is a future (token, layer).  For each target, SPICE forecasts a set
+    of experts that may miss. GOS submits only the prefix that (1) can complete
+    before the target deadline under the current low-stream backlog and (2)
+    reduces predicted CPU burst more than it costs as future GPU hit compute.
+    """
+    if args.gos_scheduler == "dp":
+        return choose_gos_admissions_dp(candidates_by_target, resident_or_staged, issuer,
+                                        cost_table, t_fetch, t_gpu, args, stats)
+    return choose_gos_admissions_greedy(candidates_by_target, resident_or_staged, issuer,
+                                        cost_table, t_fetch, t_gpu, args, stats)
+
+
 def main() -> None:
     args = parse_args()
+    if (
+        args.prefetch_hit_admission == "oracle_value"
+        or args.residual_fetch_admission == "oracle_value"
+    ) and not args.allow_oracle_admission:
+        raise ValueError(
+            "oracle_value admission reads true future routes and is an upper-bound diagnostic; "
+            "rerun with --allow_oracle_admission to make that explicit"
+        )
     torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed)
     # verified-gate negative admission: top-k ranks (0=highest gate) whose MISSES are shared-substituted
@@ -625,16 +748,62 @@ def main() -> None:
                 return None
             return max(cache, key=lambda k: ((k[0] - cur_layer) % n_layers or n_layers, -last_used.get(k, -1)))
 
-        def should_admit_prefetch_hit(key, cur_layer, current_routed_keys):
-            policy_admit = "never" if args.no_admit_prefetch_hits else args.prefetch_hit_admission
+        def count_future_hits(true_top, key, ti):
+            horizon = max(0, args.admit_value_horizon_tokens)
+            if horizon <= 0:
+                return 0
+            layer, expert = key
+            start = ti + 1
+            end = min(true_top.shape[1], start + horizon)
+            if layer < 0 or layer >= true_top.shape[0] or start >= end:
+                return 0
+            hits = (true_top[layer, start:end] == int(expert)).any(dim=-1)
+            return int(hits.sum().item())
+
+        def record_resident_admit_stats(source, accept):
+            stats["resident_admit_decisions"] += 1
+            stats[f"{source}_admit_decisions"] += 1
+            if accept:
+                stats["resident_admit_accepted"] += 1
+                stats[f"{source}_admit_accepted"] += 1
+            else:
+                stats["resident_admit_rejected"] += 1
+                stats[f"{source}_admit_rejected"] += 1
+
+        def oracle_value_admit(key, cur_layer, true_top, ti):
+            victim = ls_victim(cur_layer)
+            cand_hits = count_future_hits(true_top, key, ti)
+            victim_hits = 0 if victim is None else count_future_hits(true_top, victim, ti)
+            cpu1 = measured_cpu_cost_ms(1, cost_table)
+            saved_per_hit = max(0.0, (cpu1 if cpu1 is not None else 0.0) - t_gpu)
+            value_ms = (cand_hits - victim_hits) * saved_per_hit
+            stats["resident_admit_oracle_cand_hits"] += cand_hits
+            stats["resident_admit_oracle_victim_hits"] += victim_hits
+            stats["resident_admit_oracle_value_ms"] += value_ms
+            if victim is None:
+                return cand_hits * saved_per_hit >= args.resident_value_margin_ms
+            return value_ms >= args.resident_value_margin_ms
+
+        def resolve_resident_admission_policy(source):
+            prefetch_policy = "never" if args.no_admit_prefetch_hits else args.prefetch_hit_admission
+            if source == "prefetch":
+                return prefetch_policy
+            if args.residual_fetch_admission == "same_as_prefetch":
+                return prefetch_policy
+            return args.residual_fetch_admission
+
+        def should_admit_resident(key, cur_layer, current_routed_keys, true_top, ti, source):
+            policy_admit = resolve_resident_admission_policy(source)
             if policy_admit == "always":
-                stats["prefetch_admit_decisions"] += 1
-                stats["prefetch_admit_accepted"] += 1
+                record_resident_admit_stats(source, True)
                 return True
             if policy_admit == "never":
-                stats["prefetch_admit_decisions"] += 1
-                stats["prefetch_admit_rejected"] += 1
+                record_resident_admit_stats(source, False)
                 return False
+            if policy_admit == "oracle_value":
+                accept = oracle_value_admit(key, cur_layer, true_top, ti)
+                record_resident_admit_stats(source, accept)
+                return accept
             victim = ls_victim(cur_layer)
             cand_pop = pop[key[0]][key[1]]
             victim_pop = -1 if victim is None else pop[victim[0]][victim[1]]
@@ -648,15 +817,16 @@ def main() -> None:
                     or cand_recent > victim_recent
                     or (cand_recent == victim_recent and cand_pop > victim_pop)
                 )
-                stats["prefetch_admit_cand_recent"] += cand_recent
-                stats["prefetch_admit_victim_recent"] += max(0, victim_recent)
+                stats["resident_admit_cand_recent"] += cand_recent
+                stats["resident_admit_victim_recent"] += max(0, victim_recent)
+                stats[f"{source}_admit_cand_recent"] += cand_recent
+                stats[f"{source}_admit_victim_recent"] += max(0, victim_recent)
+                if source == "prefetch":
+                    stats["prefetch_admit_cand_recent"] += cand_recent
+                    stats["prefetch_admit_victim_recent"] += max(0, victim_recent)
             else:
                 accept = victim is None or cand_pop > victim_pop
-            stats["prefetch_admit_decisions"] += 1
-            if accept:
-                stats["prefetch_admit_accepted"] += 1
-            else:
-                stats["prefetch_admit_rejected"] += 1
+            record_resident_admit_stats(source, accept)
             return accept
 
         def update_recent(layer, routed_keys):
@@ -787,7 +957,7 @@ def main() -> None:
                         if from_low_slot:
                             low_admit_after_hits.append((key, slot_id, slot))
                     for key, slot_id, slot in low_admit_after_hits:
-                        if should_admit_prefetch_hit(key, layer, routed_keys):
+                        if should_admit_resident(key, layer, routed_keys, true_top, ti, "prefetch"):
                             admit_to_resident(key, slot, layer)
                         issuer.release_low_slot(slot_id)
 
@@ -797,7 +967,8 @@ def main() -> None:
                         torch.cuda.current_stream(dev).wait_stream(issuer.high_stream)
                     for rec in high_fetches:
                         expert_gpu(x_gpu, rec["slot"])
-                        admit_to_resident(rec["key"], rec["slot"], layer)
+                        if should_admit_resident(rec["key"], layer, routed_keys, true_top, ti, "residual"):
+                            admit_to_resident(rec["key"], rec["slot"], layer)
                     if cpu_done_event is not None:
                         cpu_done_event.synchronize()
                     stats["residual_fetches"] += len(fetch_keys)
@@ -831,11 +1002,19 @@ def main() -> None:
         row["tpot_ms_max"] = float(max(tpots))
         for k in ["routed", "hits", "resident_hits", "staging_hits", "misses", "substituted",
                   "residual_fetches", "cpu_served", "cache_evictions",
+                  "resident_admit_decisions", "resident_admit_accepted", "resident_admit_rejected",
+                  "resident_admit_cand_recent", "resident_admit_victim_recent",
+                  "resident_admit_oracle_cand_hits", "resident_admit_oracle_victim_hits",
+                  "resident_admit_oracle_value_ms",
                   "prefetch_admit_decisions", "prefetch_admit_accepted", "prefetch_admit_rejected",
                   "prefetch_admit_cand_recent", "prefetch_admit_victim_recent",
+                  "residual_admit_decisions", "residual_admit_accepted", "residual_admit_rejected",
+                  "residual_admit_cand_recent", "residual_admit_victim_recent",
                   "gos_candidates", "gos_admitted", "gos_targets", "gos_backlog_copies", "gos_slot_reserved",
                   "gos_reject_slot_targets", "gos_reject_deadline_targets",
                   "gos_reject_value_targets", "gos_reject_unmeasured_targets",
+                  "gos_reject_global_targets", "gos_dp_states", "gos_dp_selected_value_ms",
+                  "gos_dp_selected_copies",
                   "prefetch_intents", "prefetch_submitted", "prefetch_completed", "prefetch_useful",
                   "prefetch_waited_active", "prefetch_intent_cancelled", "prefetch_intent_expired",
                   "prefetch_staged_expired", "prefetch_completed_expired",
@@ -848,8 +1027,10 @@ def main() -> None:
               f"pf_sub/tok={row['prefetch_submitted_per_tok']:6.2f} pf_use/tok={row['prefetch_useful_per_tok']:6.2f} "
               f"pf_wait/tok={row['prefetch_waited_active_per_tok']:6.2f} "
               f"gos_admit/tok={row['gos_admitted_per_tok']:6.2f} "
+              f"res_admit/tok={row['resident_admit_accepted_per_tok']:6.2f}/{row['resident_admit_decisions_per_tok']:6.2f} "
               f"gos_deadline_rej/tok={row['gos_reject_deadline_targets_per_tok']:6.2f} "
               f"gos_value_rej/tok={row['gos_reject_value_targets_per_tok']:6.2f} "
+              f"gos_global_rej/tok={row['gos_reject_global_targets_per_tok']:6.2f} "
               f"gos_unmeasured_rej/tok={row['gos_reject_unmeasured_targets_per_tok']:6.2f} "
               f"pf_wait_ms/tok={row['prefetch_waited_active_ms_per_tok']:6.2f} "
               f"resid_wait_ms/tok={row['residual_fetch_wait_ms_per_tok']:6.2f}",
