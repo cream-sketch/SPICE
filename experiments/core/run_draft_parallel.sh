@@ -21,7 +21,7 @@ run_one() {
   local out="$ROOT/$name"
   mkdir -p "$out"/{train,eval}
   echo "START $name gpu=$gpu seed=$seed steps=$STEPS"
-  "$PY" train_draft_model.py \
+  "$PY" draft/train_draft_model.py \
     --gpu "$gpu" \
     --seed "$seed" \
     --out_dir "$out/train" \
@@ -41,7 +41,7 @@ run_one() {
     --warmup 200 \
     --align_lambda 0.1 \
     --log_every "$LOG_EVERY"
-  "$PY" eval_draft_prefetch.py \
+  "$PY" draft/eval_draft_prefetch.py \
     --gpu "$gpu" \
     --seed "$seed" \
     --out_dir "$out/eval" \
