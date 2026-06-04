@@ -172,6 +172,9 @@ def main() -> None:
     p.add_argument("--max_length", type=int, default=128)
     p.add_argument("--dump_forecast", default=None,
                    help="if set, dump per-text true routing + draft forecast tensors to this dir")
+    p.add_argument("--oracle_fcast", action="store_true",
+                   help="fill fcast with the TRUE future routes (perfect-prediction upper bound) instead of "
+                        "the draft prediction; for an apples-to-apples real-vs-oracle GOS comparison")
     args = p.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -223,12 +226,20 @@ def main() -> None:
                 for i, ml in enumerate(moe_layers):
                     true_top[i] = true_topk[ml].cpu()
                 fcast = torch.full((ndump, args.max_horizon, s, args.top_k), -1, dtype=torch.long)
-                for (anchor, target), pred_ids in preds.items():
-                    if anchor not in idx_of or target not in idx_of:
-                        continue
-                    h = target - anchor  # contiguous MoE layers -> dump target index = idx_of[anchor]+h
-                    if 0 <= h < args.max_horizon:
-                        fcast[idx_of[anchor], h] = pred_ids.cpu()
+                if args.oracle_fcast:
+                    # ORACLE upper bound: fcast = the TRUE future routes (perfect prediction) on the
+                    # SAME sequences, so a real-vs-oracle GOS comparison is apples-to-apples.
+                    for i in range(ndump):
+                        for h in range(args.max_horizon):
+                            if i + h < ndump:
+                                fcast[i, h] = true_top[i + h]
+                else:
+                    for (anchor, target), pred_ids in preds.items():
+                        if anchor not in idx_of or target not in idx_of:
+                            continue
+                        h = target - anchor  # contiguous MoE layers -> dump target index = idx_of[anchor]+h
+                        if 0 <= h < args.max_horizon:
+                            fcast[idx_of[anchor], h] = pred_ids.cpu()
                 fname = f"fc_{ti:05d}.pt"
                 torch.save({"true_top": true_top, "fcast": fcast, "num_layers": ndump,
                             "top_k": args.top_k, "max_horizon": args.max_horizon}, dump_dir / fname)
