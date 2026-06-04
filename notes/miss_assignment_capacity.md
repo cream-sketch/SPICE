@@ -430,3 +430,71 @@ Submitting only one low-priority prefetch tile before a residual big H2D bounds 
 This does not contradict the earlier topology result that tiled full-expert prefetch is not a throughput win. Its value
 is latency isolation: chunking or shallow dispatch limits how much useless draft traffic can block an exact residual
 fetch.
+
+## Real CUDA runtime bridge: admission beats deeper prefetch
+
+Implementation: `experiments/harness/spice_shallow_issuer_runtime.py`.
+
+This harness consumes a real SPICE forecast dump (`true_top`, `fcast`) and runs a trace-driven CUDA timing loop with
+real pinned host expert banks, real device resident/staging/fetch slots, real H2D copies, real GPU expert GEMMs from the
+owning slot, and real CPU expert GEMMs. It is still a diagnostic timing harness, not a full source-only model runtime:
+dense/attention is represented by a calibrated filler GEMM and logits are not checked.
+
+Second-pass review fixed the earlier fatal modeling bugs:
+
+- CPU fallback uses scoped activation D2H and output H2D events, not device-wide synchronization.
+- Staged low-prefetch experts retain their HBM slot until use or deadline expiry.
+- Resident, prefetched, and residual-fetched experts compute from owned device slots.
+- Demand misses cancel/promote pending low prefetch state rather than silently duplicating it.
+- Low-hit admission is delayed until same-layer hit GEMMs have been enqueued, preventing same-layer resident-slot overwrite.
+- Missing cost-table entries conservatively choose all-CPU rather than throwing `KeyError`.
+
+Evidence:
+
+- `notes/evidence/filler_gemm_calibration_a800_v1.json`: A800 bf16 4096x4096 GEMM median 0.579 ms.
+- `notes/evidence/qwen_forecast_small_v1_metrics.json`: training-free SPICE draft slot recall is 1.00/0.90/0.85/0.82/0.79/0.77 for horizons 1..6.
+- `notes/evidence/shallow_runtime_qwen_t16_32_f4096_deep_dagfix_v2.json`
+- `notes/evidence/shallow_runtime_qwen_t16_32_f4096_depth{0,1,2,4,8}_dagfix_v2.json`
+- `notes/evidence/shallow_runtime_qwen_t16_32_f4096_depth2_minlead{1,2,3,4,5}_dagfix_v1.json`
+- `notes/evidence/shallow_runtime_qwen_t16_32_f4096_dummy_dagfix_v1.json`
+
+Qwen top-4, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 32 tokens, one 4096 bf16 filler GEMM per layer:
+
+| policy | prefetch rule | TPOT ms | hits/tok | CPU misses/tok | residual fetch/tok | active-prefetch wait/tok |
+|---|---|---:|---:|---:|---:|---:|
+| deep fetch-all | all forecast H2D + residual fetch | 83.21 | 87.25 | 0.00 | 8.75 | 2.59 |
+| deep CPU | all forecast H2D + residual CPU | 72.45 | 87.00 | 9.00 | 0.00 | 11.59 |
+| shallow CPU | depth 0, no H2D prefetch | 46.67 | 23.81 | 72.19 | 0.00 | 0.00 |
+| shallow CPU | depth 1 | 50.52 | 43.78 | 52.22 | 0.00 | 20.84 |
+| shallow CPU | depth 2 | 58.38 | 60.59 | 35.41 | 0.00 | 31.41 |
+| shallow CPU | depth 4 | 64.95 | 77.34 | 18.66 | 0.00 | 25.97 |
+| shallow CPU | depth 8 | 66.12 | 81.75 | 14.25 | 0.00 | 21.94 |
+
+Deadline-gating near predictions reduces active-H2D waits but still does not beat no-prefetch in this measured regime:
+
+| depth | min prefetch lead | TPOT ms | hits/tok | CPU misses/tok | active-prefetch wait/tok |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 1 | 58.37 | 60.56 | 35.44 | 31.41 |
+| 2 | 2 | 58.09 | 59.78 | 36.22 | 28.09 |
+| 2 | 3 | 56.33 | 59.38 | 36.62 | 25.78 |
+| 2 | 4 | 55.85 | 59.19 | 36.81 | 22.91 |
+| 2 | 5 | 55.47 | 58.59 | 37.41 | 17.41 |
+
+The apples-to-apples dummy control disables prefetch hits while keeping forecast H2D traffic. Miss counts are identical,
+so the remaining difference isolates copy-engine interference:
+
+| policy | TPOT ms | hits/tok | misses/tok | CPU misses/tok | prefetch submitted/tok |
+|---|---:|---:|---:|---:|---:|
+| deep dummy CPU | 64.72 | 23.81 | 72.19 | 72.19 | 81.88 |
+| shallow dummy CPU | 55.15 | 23.81 | 72.19 | 72.19 | 46.91 |
+
+Interpretation:
+
+- The SPICE draft information is strong; the runtime failure mode is materializing too much correct information as
+  17MB H2D traffic.
+- A forecasted expert that is still in the H2D queue at the demand point is a stall, not a useful hit.
+- In this A800/Qwen/16-thread batch-1 regime, the best exact same-precision action is negative admission: do not submit
+  forecast H2D, and serve residual misses from CPU/DRAM.
+- This does not invalidate the event replay. It sharpens the implementable story: SPICE should be a verified
+  expert-demand oracle feeding a resource-DAG admission controller, not a fetch-all prefetcher. The controller's first
+  job is deciding when *not* to turn a correct forecast into PCIe traffic.
