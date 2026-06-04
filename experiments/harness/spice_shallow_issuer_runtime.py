@@ -30,6 +30,9 @@ Policies:
   gos_cpu             : SPICE global overflow scheduler. Forecasted experts are
                         admitted to H2D only when they reduce a future CPU miss
                         burst and can finish before that future-layer deadline.
+  gos_dummy_cpu       : same GOS-admitted H2D traffic, but prefetched experts are
+                        not consumed as hits; isolates whether GOS traffic helps
+                        by serving future misses or only perturbs timing.
 
 The key question is whether a real software issuer that limits submitted low
 H2D depth can preserve SPICE prefetch utility without letting draft traffic
@@ -579,7 +582,7 @@ def main() -> None:
                     # much low traffic can be ahead of a future demand miss.
                     max_lead = min(args.max_lead_layers, max_horizon - 1, n_layers - layer - 1)
                     resident_or_staged = set(resident_map) | issuer.staged_keys() | set(issuer.pending)
-                    if policy == "gos_cpu":
+                    if policy in ("gos_cpu", "gos_dummy_cpu"):
                         candidates_by_target = defaultdict(list)
                         for lead in range(max(1, args.min_prefetch_lead), max_lead + 1):
                             target_layer = layer + lead
