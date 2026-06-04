@@ -533,6 +533,11 @@ Evidence:
 - `notes/evidence/gos_qwen_wiki64_1024_normal_admit_final_v1.json`
 - `notes/evidence/gos_qwen_wiki64_1024_servedonly_final_v1.json`
 - `notes/evidence/gos_qwen_wiki64_1024_dummy_final_v1.json`
+- `notes/evidence/ds_oracle_forecast_big_v1/manifest.json`
+- `notes/evidence/gos_deepseek_oracle_256_depth0_v1.json`
+- `notes/evidence/gos_deepseek_oracle_256_normal_admit_v1.json`
+- `notes/evidence/gos_deepseek_oracle_256_servedonly_v1.json`
+- `notes/evidence/gos_deepseek_oracle_256_dummy_v1.json`
 
 The larger WikiText-derived Qwen forecast dump contains 64 texts and 6681 total tokens. The runtime uses `lead=1` for
 the next layer; this corresponds to the dump quality report's `horizon=2` because `horizon=1` is the same-layer exact
@@ -557,6 +562,24 @@ Qwen WikiText larger trace, same resource configuration, 1024 test tokens:
 | GOS transient staging only | 47.35 | 1.10x | 16.10 | 35.82 | 44.08 | 39.65 | 0.00 | 0.00 |
 | GOS perturbation control | 57.72 | 0.90x | 16.10 | 0.00 | 79.90 | 40.49 | 0.00 | 0.00 |
 
+DeepSeek-V2-Lite currently uses an **oracle future-route forecast** generated from decode traces, not a deployable
+SPICE draft. This is a resource-scheduler upper bound: it asks whether GOS would help on DeepSeek if future expert
+demand were known perfectly. The dump contains 159 traces, 34452 valid tokens, 26 MoE layers, and top-6 routes.
+
+DeepSeek top-6, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 256 test tokens, one 4096 bf16 filler GEMM/layer:
+
+| policy | TPOT ms | speedup vs CPU-only | resident hit/tok | staging hit/tok | CPU misses/tok | staged H2D/tok | cache evict/tok | active wait/tok |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| depth0 CPU fallback | 72.48 | 1.00x | 21.02 | 0.00 | 134.98 | 0.00 | 0.00 | 0.00 |
+| GOS + resident admission | 65.38 | 1.11x | 38.41 | 47.33 | 70.26 | 47.33 | 47.33 | 0.00 |
+| GOS transient staging only | 67.01 | 1.08x | 21.02 | 48.56 | 86.42 | 48.56 | 0.00 | 0.00 |
+| GOS perturbation control | 88.62 | 0.82x | 21.02 | 0.00 | 134.98 | 48.56 | 0.00 | 0.00 |
+
+This upper-bound run strengthens the resource claim but not the final predictor claim. GOS cuts CPU miss service on
+DeepSeek as well, and the perturbation control is strongly negative, so useful on-time staging is doing real work. Unlike
+Qwen, resident admission is slightly better than transient-only in this oracle setting, which means the cache-admission
+decision should be model/regime-aware rather than hard-coded to "never admit".
+
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
 state. It still rules out the easiest false explanation. Injecting GOS-admitted H2D traffic without consuming the staged
 experts is much slower (`60.74ms` on the 64-token diagnostic and `57.72ms` on the 1024-token trace), so the gain is not
@@ -573,6 +596,6 @@ Interpretation:
   universal prefetch story.
 - `--gos_cpu_overlap_ms` is a calibrated policy constant in this diagnostic harness. The final system needs to estimate
   it online or replace it with measured per-layer slack.
-- Remaining evidence needed before paper-level claims: DeepSeek replication, larger forecast traces, Nsight confirmation
-  that the main gain is removal of low-hit D2D cache admission, and a calibrated production overlap model instead of a
-  fixed `--gos_cpu_overlap_ms`.
+- Remaining evidence needed before paper-level claims: a real DeepSeek SPICE/draft forecast rather than oracle future
+  routes, larger/repeated DeepSeek runtime traces, Nsight confirmation that Qwen's main gain is removal of low-hit D2D
+  cache admission, and a calibrated production overlap model instead of a fixed `--gos_cpu_overlap_ms`.
