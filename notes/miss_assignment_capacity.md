@@ -538,6 +538,10 @@ Evidence:
 - `notes/evidence/gos_deepseek_oracle_256_normal_admit_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_servedonly_v1.json`
 - `notes/evidence/gos_deepseek_oracle_256_dummy_v1.json`
+- `notes/evidence/gos_qwen_t16_64_f4096_hotter_admit_v9.json`
+- `notes/evidence/gos_qwen_t16_64_f4096_recent_admit_w8_v10.json`
+- `notes/evidence/gos_deepseek_oracle_256_hotter_admit_v1.json`
+- `notes/evidence/gos_deepseek_oracle_256_recent_admit_w8_v1.json`
 
 The larger WikiText-derived Qwen forecast dump contains 64 texts and 6681 total tokens. The runtime uses `lead=1` for
 the next layer; this corresponds to the dump quality report's `horizon=2` because `horizon=1` is the same-layer exact
@@ -576,21 +580,46 @@ DeepSeek top-6, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 256 test tokens
 | GOS perturbation control | 88.62 | 0.82x | 21.02 | 0.00 | 134.98 | 48.56 | 0.00 | 0.00 |
 
 This upper-bound run strengthens the resource claim but not the final predictor claim. GOS cuts CPU miss service on
-DeepSeek as well, and the perturbation control is strongly negative, so useful on-time staging is doing real work. Unlike
-Qwen, resident admission is slightly better than transient-only in this oracle setting, which means the cache-admission
-decision should be model/regime-aware rather than hard-coded to "never admit".
+DeepSeek as well. The perturbation control is strongly negative, which weakens the "H2D traffic/noise helped" explanation,
+but it is still a state-divergent control rather than a clean identical-traffic causal replay. Unlike Qwen, resident
+admission is slightly better than transient-only in this oracle setting, which means the cache-admission decision should
+be model/regime-aware rather than hard-coded to "never admit".
+
+### Cache-admission policy sweep
+
+The Qwen and DeepSeek results disagree on whether a staged hit should be promoted into the resident expert cache after
+use: Qwen prefers transient-only staging, while DeepSeek's oracle run prefers always admitting staged hits. Two simple
+online admission heuristics were therefore tested:
+
+- `hotter_than_victim`: admit only if the candidate's train-trace popularity exceeds the LS victim's popularity.
+- `recent_reuse`: admit if the candidate has more recent same-layer route reuse than the LS victim within an 8-token
+  window, with train popularity as a tie-breaker.
+
+| model/run | always admit | never admit | hotter-than-victim | recent-reuse w=8 |
+|---|---:|---:|---:|---:|
+| Qwen 64-token real SPICE forecast | 47.76 ms | 44.23 ms | 49.42 ms | 49.10 ms |
+| DeepSeek 256-token oracle forecast | 65.38 ms | 67.01 ms | 88.45 ms | 68.56 ms |
+
+These simple cache heuristics are not good enough. `hotter_than_victim` rejects nearly every staged-hit promotion, which
+removes DeepSeek's resident-cache benefit. `recent_reuse` admits a subset, but still misses the better extreme in both
+tested regimes. The useful lesson is negative but actionable: cache promotion cannot be a local hotness rule bolted onto
+GOS. It must be part of the same global resource scheduler, using measured regime feedback (CPU pressure, HBM churn, and
+future useful-hit value) to choose among always-admit, transient-only, or a calibrated intermediate policy.
 
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
-state. It still rules out the easiest false explanation. Injecting GOS-admitted H2D traffic without consuming the staged
-experts is much slower (`60.74ms` on the 64-token diagnostic and `57.72ms` on the 1024-token trace), so the gain is not
-from copy-engine noise; it comes from useful on-time staging that reduces CPU miss burst.
+state. It is therefore a perturbation sanity check, not a definitive causal isolation. Injecting GOS-admitted H2D traffic
+without consuming the staged experts is much slower (`60.74ms` on the 64-token diagnostic and `57.72ms` on the 1024-token
+trace), so copy-engine noise alone is not a plausible positive explanation; the useful work is on-time staging that
+reduces CPU miss burst.
 
 Interpretation:
 
 - Correct forecasts should not automatically become resident-cache admissions. The useful primitive is **transient
   staging**: a one-shot H2D service path for predicted overflow misses.
-- GOS is a positive, SPICE-native miss-handling mechanism in the measured pressure regime: it uses SPICE future-demand
-  information to choose which misses should consume PCIe and which should remain CPU-served.
+- GOS is a positive, SPICE-native miss-handling mechanism in the measured Qwen pressure regime: it uses SPICE
+  future-demand information to choose which misses should consume PCIe and which should remain CPU-served. The DeepSeek
+  evidence above is oracle-only upper-bound evidence for the same resource controller, not a deployable SPICE predictor
+  result yet.
 - The gain is regime-dependent. A no-filler stress run showed small positive results in one batch but substantial timing
   noise in a later rerun, so it is not used as main evidence yet. This supports a resource-DAG story rather than a
   universal prefetch story.
@@ -598,4 +627,5 @@ Interpretation:
   it online or replace it with measured per-layer slack.
 - Remaining evidence needed before paper-level claims: a real DeepSeek SPICE/draft forecast rather than oracle future
   routes, larger/repeated DeepSeek runtime traces, Nsight confirmation that Qwen's main gain is removal of low-hit D2D
-  cache admission, and a calibrated production overlap model instead of a fixed `--gos_cpu_overlap_ms`.
+  cache admission, a calibrated production overlap model instead of a fixed `--gos_cpu_overlap_ms`, and a stronger
+  resident-admission model if we want one policy to cover both Qwen-like and DeepSeek-like regimes.

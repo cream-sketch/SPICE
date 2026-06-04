@@ -160,6 +160,9 @@
     "fc_00157.pt",
     "fc_00158.pt"
   ],
+  "num_files": 159,
+  "total_tokens": 34452,
+  "num_layers": 26,
   "top_k": 6,
   "max_horizon": 6,
   "model_dir": "deepseek-v2-lite",

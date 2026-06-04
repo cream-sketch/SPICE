@@ -30,6 +30,8 @@ Policies:
   gos_cpu             : SPICE global overflow scheduler. Forecasted experts are
                         admitted to H2D only when they reduce a future CPU miss
                         burst and can finish before that future-layer deadline.
+                        Staged hits can then be promoted to the resident cache
+                        using always/never/diagnostic selective-admission rules.
   gos_dummy_cpu       : GOS-admitted H2D perturbation control. Prefetched experts
                         are not consumed as hits, so this is a state-divergent
                         control, not an identical-traffic replay.
@@ -103,6 +105,14 @@ def parse_args() -> argparse.Namespace:
                    help="calibrated resident GPU expert compute time used by GOS value model")
     p.add_argument("--no_admit_prefetch_hits", action="store_true",
                    help="serve low-prefetch hits from staging slots and release them without main-stream D2D cache admission")
+    p.add_argument("--prefetch_hit_admission", choices=["always", "never", "hotter_than_victim", "recent_reuse"],
+                   default="always",
+                   help="resident-cache promotion policy after a staged prefetch hit is consumed. "
+                        "'always' preserves old behavior; 'never' is equivalent to --no_admit_prefetch_hits; "
+                        "'hotter_than_victim' promotes only when train popularity beats the LS victim; "
+                        "'recent_reuse' uses online same-layer recent route reuse against the LS victim.")
+    p.add_argument("--admit_recent_window", type=int, default=8,
+                   help="token window for --prefetch_hit_admission=recent_reuse")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -592,6 +602,8 @@ def main() -> None:
         cache = warm_cache(pop, cap)
         resident_map, free_resident = setup_resident(cache)
         last_used = {k: 0 for k in cache}
+        recent_by_layer = [deque() for _ in range(n_layers)]
+        recent_count = [[0 for _ in range(n_experts)] for _ in range(n_layers)]
         stats = defaultdict(float)
         pos = 0
         tokens_done = 0
@@ -607,6 +619,57 @@ def main() -> None:
                 sid = 0
             stats["cache_evictions"] += 1
             return sid
+
+        def ls_victim(cur_layer):
+            if free_resident or not cache:
+                return None
+            return max(cache, key=lambda k: ((k[0] - cur_layer) % n_layers or n_layers, -last_used.get(k, -1)))
+
+        def should_admit_prefetch_hit(key, cur_layer, current_routed_keys):
+            policy_admit = "never" if args.no_admit_prefetch_hits else args.prefetch_hit_admission
+            if policy_admit == "always":
+                stats["prefetch_admit_decisions"] += 1
+                stats["prefetch_admit_accepted"] += 1
+                return True
+            if policy_admit == "never":
+                stats["prefetch_admit_decisions"] += 1
+                stats["prefetch_admit_rejected"] += 1
+                return False
+            victim = ls_victim(cur_layer)
+            cand_pop = pop[key[0]][key[1]]
+            victim_pop = -1 if victim is None else pop[victim[0]][victim[1]]
+            if policy_admit == "recent_reuse":
+                cand_recent = recent_count[key[0]][key[1]] + (1 if key in current_routed_keys else 0)
+                victim_recent = -1 if victim is None else (
+                    recent_count[victim[0]][victim[1]] + (1 if victim in current_routed_keys else 0)
+                )
+                accept = (
+                    victim is None
+                    or cand_recent > victim_recent
+                    or (cand_recent == victim_recent and cand_pop > victim_pop)
+                )
+                stats["prefetch_admit_cand_recent"] += cand_recent
+                stats["prefetch_admit_victim_recent"] += max(0, victim_recent)
+            else:
+                accept = victim is None or cand_pop > victim_pop
+            stats["prefetch_admit_decisions"] += 1
+            if accept:
+                stats["prefetch_admit_accepted"] += 1
+            else:
+                stats["prefetch_admit_rejected"] += 1
+            return accept
+
+        def update_recent(layer, routed_keys):
+            if args.admit_recent_window <= 0:
+                return
+            uniq = tuple(sorted(set(e for _l, e in routed_keys)))
+            recent_by_layer[layer].append(uniq)
+            for e in uniq:
+                recent_count[layer][e] += 1
+            while len(recent_by_layer[layer]) > args.admit_recent_window:
+                old = recent_by_layer[layer].popleft()
+                for e in old:
+                    recent_count[layer][e] -= 1
 
         def admit_to_resident(key, src_slot, cur_layer):
             sid = resident_map.get(key)
@@ -667,6 +730,7 @@ def main() -> None:
                     issuer.poll(ti, layer)
 
                     routed = [int(x) for x in true_top[layer, ti].tolist()]
+                    routed_keys = {(layer, e) for e in routed}
                     hit_items = []  # (key, slot_id_or_None, slot, from_low_slot)
                     misses = []
                     for rank, e in enumerate(routed):  # true_top is gate-descending: rank 0 = highest gate
@@ -723,7 +787,7 @@ def main() -> None:
                         if from_low_slot:
                             low_admit_after_hits.append((key, slot_id, slot))
                     for key, slot_id, slot in low_admit_after_hits:
-                        if not args.no_admit_prefetch_hits:
+                        if should_admit_prefetch_hit(key, layer, routed_keys):
                             admit_to_resident(key, slot, layer)
                         issuer.release_low_slot(slot_id)
 
@@ -738,6 +802,7 @@ def main() -> None:
                         cpu_done_event.synchronize()
                     stats["residual_fetches"] += len(fetch_keys)
                     stats["cpu_served"] += len(cpu_keys)
+                    update_recent(layer, routed_keys)
                 tokens_done += 1
                 if tokens_done >= args.max_test_tokens:
                     break
@@ -766,6 +831,8 @@ def main() -> None:
         row["tpot_ms_max"] = float(max(tpots))
         for k in ["routed", "hits", "resident_hits", "staging_hits", "misses", "substituted",
                   "residual_fetches", "cpu_served", "cache_evictions",
+                  "prefetch_admit_decisions", "prefetch_admit_accepted", "prefetch_admit_rejected",
+                  "prefetch_admit_cand_recent", "prefetch_admit_victim_recent",
                   "gos_candidates", "gos_admitted", "gos_targets", "gos_backlog_copies", "gos_slot_reserved",
                   "gos_reject_slot_targets", "gos_reject_deadline_targets",
                   "gos_reject_value_targets", "gos_reject_unmeasured_targets",

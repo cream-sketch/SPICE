@@ -29,12 +29,14 @@ def main():
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     names = []
     L = K = None
+    total_tokens = 0
     for i, f in enumerate(files):
         d = torch.load(f, map_location="cpu", weights_only=False)
         steps = [s for s in d["steps"] if all(x is not None for x in s[1])]
         if not steps:
             continue
         L = len(steps[0][1]); K = len(steps[0][1][0]); T = len(steps)
+        total_tokens += T
         # true_top[L, T, K] gate-descending (gen_decode_traces used torch.topk)
         true_top = torch.zeros(L, T, K, dtype=torch.long)
         for t, (_tid, per_layer) in enumerate(steps):
@@ -55,7 +57,8 @@ def main():
             "upper-bound only, not an implementable draft predictor") if args.oracle_future_fcast else (
             "true_top from decode traces; fcast placeholder (-1), valid only for depth=0 runs")
     (out / "manifest.json").write_text(json.dumps(
-        {"files": names, "top_k": K, "max_horizon": args.max_horizon, "model_dir": args.model_dir,
+        {"files": names, "num_files": len(names), "total_tokens": total_tokens,
+         "num_layers": L, "top_k": K, "max_horizon": args.max_horizon, "model_dir": args.model_dir,
          "oracle_future_fcast": bool(args.oracle_future_fcast), "note": note}, indent=2))
     print(f"[done] wrote {len(names)} forecast files (L={L}, K={K}) -> {out}")
 
