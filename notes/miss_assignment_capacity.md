@@ -528,6 +528,16 @@ Evidence:
 - `notes/evidence/gos_qwen_t16_64_f4096_normal_admit_final_v8.json`
 - `notes/evidence/gos_qwen_t16_64_f4096_servedonly_final_v8.json`
 - `notes/evidence/gos_qwen_t16_64_f4096_dummy_final_v8.json`
+- `notes/evidence/qwen_forecast_wiki64_v1_metrics.json`
+- `notes/evidence/gos_qwen_wiki64_1024_depth0_final_v1.json`
+- `notes/evidence/gos_qwen_wiki64_1024_normal_admit_final_v1.json`
+- `notes/evidence/gos_qwen_wiki64_1024_servedonly_final_v1.json`
+- `notes/evidence/gos_qwen_wiki64_1024_dummy_final_v1.json`
+
+The larger WikiText-derived Qwen forecast dump contains 64 texts and 6681 total tokens. The runtime uses `lead=1` for
+the next layer; this corresponds to the dump quality report's `horizon=2` because `horizon=1` is the same-layer exact
+anchor. Training-free SPICE draft recall remains high on the larger dump: `0.884/0.838/0.806/0.778/0.752` for runtime
+leads 1..5.
 
 Qwen top-4, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 64 tokens, one 4096 bf16 filler GEMM/layer:
 
@@ -538,10 +548,19 @@ Qwen top-4, 10% HBM residency, 16 CPU threads, bf16 CPU/GPU, 64 tokens, one 4096
 | GOS transient staging only | 44.23 | 1.11x | 24.83 | 33.73 | 37.44 | 37.61 | 0.00 | 0.00 |
 | GOS perturbation control | 60.74 | 0.81x | 24.83 | 0.00 | 71.17 | 38.12 | 0.00 | 0.00 |
 
+Qwen WikiText larger trace, same resource configuration, 1024 test tokens:
+
+| policy | TPOT ms | speedup vs CPU-only | resident hit/tok | staging hit/tok | CPU misses/tok | staged H2D/tok | cache evict/tok | active wait/tok |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| depth0 CPU fallback | 51.98 | 1.00x | 16.10 | 0.00 | 79.90 | 0.00 | 0.00 | 0.00 |
+| GOS + resident admission | 50.32 | 1.03x | 20.59 | 34.63 | 40.78 | 39.03 | 34.63 | 0.00 |
+| GOS transient staging only | 47.35 | 1.10x | 16.10 | 35.82 | 44.08 | 39.65 | 0.00 | 0.00 |
+| GOS perturbation control | 57.72 | 0.90x | 16.10 | 0.00 | 79.90 | 40.49 | 0.00 | 0.00 |
+
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
 state. It still rules out the easiest false explanation. Injecting GOS-admitted H2D traffic without consuming the staged
-experts is much slower (`60.74ms` in the filler regime), so the gain is not from copy-engine noise; it comes from useful
-on-time staging that reduces CPU miss burst.
+experts is much slower (`60.74ms` on the 64-token diagnostic and `57.72ms` on the 1024-token trace), so the gain is not
+from copy-engine noise; it comes from useful on-time staging that reduces CPU miss burst.
 
 Interpretation:
 
