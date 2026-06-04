@@ -548,6 +548,7 @@ Evidence:
 - `notes/evidence/gos_qwen_wiki64_64_dp_transient_fairparams_v4.json`
 - `notes/evidence/gos_qwen_wiki64_64_always_admit_fairparams_v5.json`
 - `notes/evidence/gos_qwen_wiki64_64_oracle_admit_fairparams_v4.json`
+- `notes/evidence/admit_decisive_v4_lifecycle/{greedy_transient,dp_transient,always,oracle_cost0}.json`
 
 The larger WikiText-derived Qwen forecast dump contains 64 texts and 6681 total tokens. The runtime uses `lead=1` for
 the next layer; this corresponds to the dump quality report's `horizon=2` because `horizon=1` is the same-layer exact
@@ -652,10 +653,24 @@ This rerun overturns the earlier small-sample admission conclusion. With the cur
 current value model, true-future oracle resident admission is the best 64-token diagnostic row, ahead of greedy-transient,
 always-admit, and DP-transient. The result is still not a deployable mainline claim: it reads future ground-truth routes,
 the table covers only 64 held-out tokens, and the oracle row has enough timing spread (`50.25-53.36ms`) that a
-1024-token / 7-repeat
-run is the decisive gate. The safe conclusion is therefore narrower: **GOS is the main positive miss-handling primitive;
-resident admission is alive as an oracle upper-bound and needs robust confirmation/calibration before it becomes part of
-the scheduler story.**
+1024-token / 7-repeat run is the decisive gate.
+
+Qwen WikiText 1024-token robust rerun with the same parameters and current lifecycle fix (`seed=11`, 7 repeats):
+
+| policy | TPOT ms | range ms | CPU misses/tok | staged useful/tok | resident admits/tok | global rejects/tok |
+|---|---:|---:|---:|---:|---:|---:|
+| greedy GOS, transient staging only | 48.50 | 46.36-52.98 | 48.15 | 31.75 | 0.00 / 31.75 | 0.00 |
+| DP GOS, transient staging only | 47.97 | 47.65-48.61 | 52.79 | 27.11 | 0.00 / 27.11 | 6.83 |
+| greedy GOS, always admit staged hits | 47.89 | 47.25-48.95 | 48.68 | 27.64 | 27.64 / 27.64 | 0.00 |
+| greedy GOS, oracle-value resident admission | 49.32 | 48.63-54.71 | 36.00 | 33.85 | 11.74 / 33.85 | 0.00 |
+
+The 1024-token gate does **not** validate oracle-value resident admission as a mainline positive result. It reduces CPU
+misses, but the cache churn/staging-expiry tradeoff is still worse in TPOT than always-admit, DP-transient, and
+greedy-transient. The aggregate oracle-value counter is negative (`-36.83ms/tok`): admitted candidates have future hits,
+but the LS victims they displace have even more future hits on average. The non-oracle policies are close enough
+(`47.89-48.50ms`) that the robust conclusion is not "one admission heuristic wins"; it is: **GOS is the main positive
+miss-handling primitive, while resident admission is a small, regime-sensitive second-order decision that needs a
+calibrated online value model before it can be claimed as a contribution.**
 
 The perturbation control is state-divergent, not an identical replay: disabling staged hits changes later cache and CPU
 state. It is therefore a perturbation sanity check, not a definitive causal isolation. Injecting GOS-admitted H2D traffic
@@ -668,12 +683,12 @@ Interpretation:
 - Correct forecasts should not automatically become resident-cache admissions. The useful primitive is **transient
   staging**: a one-shot H2D service path for predicted overflow misses. Long-lived admission must be justified by future
   reuse value and promotion/cache-churn cost, not by the fact that a staged hit occurred.
-- A global DP over forecast targets is implemented and useful as a diagnostic, but the current 64-token rerun does not
-  make it a mainline policy. The fixed duplicate-key/deadline semantics are now covered by unit tests; the measured DP row
-  rejects some targets globally and trails greedy-transient on TPOT.
-- True-future resident admission is an upper-bound diagnostic only. Its 64-token win means resident promotion should not
-  be declared dead; it also means the deployable policy needs a stronger online value model if we want one scheduler to
-  cover both transient-overflow and cache-residency decisions.
+- A global DP over forecast targets is implemented and useful as a diagnostic, but the current robust rerun does not
+  make it a clear mainline policy. The fixed duplicate-key/deadline semantics are covered by unit tests; measured TPOT is
+  close to always-admit and greedy-transient.
+- True-future resident admission is an upper-bound diagnostic only. Its 64-token win does not survive the 1024-token
+  gate, so it should not be claimed as a positive mechanism yet. The deployable scheduler needs a stronger online value
+  model if we want one policy to cover both transient-overflow and cache-residency decisions.
 - GOS is a positive, SPICE-native miss-handling mechanism in the measured Qwen pressure regime: it uses SPICE
   future-demand information to choose which misses should consume PCIe and which should remain CPU-served. The DeepSeek
   evidence above is oracle-only upper-bound evidence for the same resource controller, not a deployable SPICE predictor
