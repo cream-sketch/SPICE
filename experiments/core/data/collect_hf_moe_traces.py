@@ -139,7 +139,7 @@ def main() -> None:
 
     name_re = re.compile(args.router_name_regex, flags=re.IGNORECASE)
     exclude_re = re.compile(args.exclude_name_regex, flags=re.IGNORECASE) if args.exclude_name_regex else None
-    active_trace: dict[str, list[Any]] = {"router_logits": [], "router_module_names": []}
+    active_trace: dict[str, list[Any]] = {"router_logits": [], "router_module_names": [], "moe_hidden": []}
     handles = []
 
     def make_hook(name: str):
@@ -148,6 +148,10 @@ def main() -> None:
                 if should_capture_router_tensor(tensor, args.min_experts, args.max_experts):
                     active_trace["router_logits"].append(tensor.detach().float().cpu())
                     active_trace["router_module_names"].append(name)
+                    # ALIGNED hidden: the router's own INPUT is exactly what it consumes (post-attention
+                    # residual), per MoE layer -> what the LoRE forecaster must predict routing FROM.
+                    rin = _inputs[0] if isinstance(_inputs, tuple) else _inputs
+                    active_trace["moe_hidden"].append(rin.detach().float().cpu())
                     break
 
         return hook
@@ -193,7 +197,7 @@ def main() -> None:
 
     with torch.no_grad():
         for batch_id, text_batch in enumerate(batched(texts, args.batch)):
-            active_trace = {"router_logits": [], "router_module_names": []}
+            active_trace = {"router_logits": [], "router_module_names": [], "moe_hidden": []}
             encoded = tokenizer(
                 text_batch,
                 return_tensors="pt",
@@ -212,6 +216,7 @@ def main() -> None:
                 "router_module_names": active_trace["router_module_names"],
                 "router_logits": active_trace["router_logits"],
                 "router_probs": router_probs,
+                "moe_hidden": active_trace["moe_hidden"],   # ALIGNED per-MoE-layer router-input hidden
                 "hidden_states": None
                 if args.no_hidden_states
                 else [state.detach().float().cpu() for state in output.hidden_states],

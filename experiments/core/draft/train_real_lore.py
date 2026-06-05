@@ -102,7 +102,10 @@ class RealLoREDraft(nn.Module):
         context = self.initial_context(h.shape[0], h.device)
         pred_hidden: list[torch.Tensor] = []
         pred_probs: list[torch.Tensor] = []
-        for layer in range(self.cfg.layers):
+        steps = min(self.cfg.layers, len(hidden_states) - 1)
+        if steps <= 0:
+            raise ValueError("RealLoREDraft.forward needs at least two hidden states")
+        for layer in range(steps):
             z = h + self.transitions[layer](h)
             logits = self.routers[layer](z) + self.context_to_logits(context)
             probs = F.softmax(logits, dim=-1)
@@ -126,29 +129,74 @@ def iter_trace_files(trace_dir: str) -> list[Path]:
     return paths
 
 
+def _first_present(obj: dict, keys: list[str]):
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            return key, obj[key]
+    return None, None
+
+
+def _probs_from_topk(topk: torch.Tensor, experts: int) -> torch.Tensor:
+    flat = topk.reshape(-1, topk.shape[-1]).long()
+    target = torch.zeros(flat.shape[0], experts, dtype=torch.float32)
+    target.scatter_(1, flat, 1.0 / float(flat.shape[1]))
+    return target
+
+
 def load_trace(path: Path) -> tuple[list[torch.Tensor], list[torch.Tensor], int]:
     obj = torch.load(path, map_location="cpu")
-    hidden_states = obj.get("hidden_states")
-    router_probs = obj.get("router_probs")
+    hidden_key, hidden_states = _first_present(obj, ["moe_hidden", "moe_hidden_states", "hidden_states"])
+    _, router_probs = _first_present(obj, ["route_probs", "router_probs", "moe_route_probs"])
+    _, route_topk = _first_present(obj, ["topk", "route_topk", "router_topk", "topk_idx"])
     router_names = obj.get("router_module_names") or []
     if hidden_states is None:
-        raise ValueError(f"{path} does not contain hidden_states; recollect traces with hidden states enabled")
-    if router_probs is None:
-        raise ValueError(f"{path} does not contain router_probs")
+        raise ValueError(f"{path} does not contain hidden_states/moe_hidden; recollect traces with hidden states enabled")
+
     def flatten_tokens(t: torch.Tensor) -> torch.Tensor:
         if t.ndim <= 2:
             return t.float()
         return t.reshape(-1, t.shape[-1]).float()
 
     hs = [flatten_tokens(t) for t in hidden_states]
-    rp = [flatten_tokens(t) for t in router_probs]
+    if router_probs is not None:
+        rp = [flatten_tokens(t) for t in router_probs]
+    elif route_topk is not None:
+        experts = int(obj.get("num_experts") or obj.get("experts") or 0)
+        if experts <= 0:
+            experts = int(max(int(t.max().item()) for t in route_topk)) + 1
+        rp = [_probs_from_topk(t, experts) for t in route_topk]
+    else:
+        raise ValueError(f"{path} does not contain route_probs/router_probs or topk targets")
+
     offset = 0
-    if router_names:
+    if hidden_key in {"moe_hidden", "moe_hidden_states"} or len(hs) == len(rp):
+        offset = 0
+    elif router_names:
         first = str(router_names[0])
         m = re.search(r"layers\.(\d+)", first)
         if m:
             offset = int(m.group(1))
     return hs, rp, offset
+
+
+def slice_trace_window(
+    hidden_states: list[torch.Tensor],
+    target_probs: list[torch.Tensor],
+    offset: int,
+    max_pairs: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    if len(hidden_states) < 2:
+        raise ValueError("trace needs at least two hidden tensors for hidden-align training")
+    start = max(0, min(int(offset), len(hidden_states) - 2))
+    available_pairs = len(hidden_states) - start - 1
+    pairs = min(len(target_probs), available_pairs)
+    if max_pairs is not None:
+        pairs = min(pairs, int(max_pairs))
+    if pairs <= 0:
+        raise ValueError(
+            f"empty trace window: hidden={len(hidden_states)} probs={len(target_probs)} offset={offset}"
+        )
+    return hidden_states[start : start + pairs + 1], target_probs[:pairs]
 
 
 def extract_layer_idx(name: str) -> int:
@@ -279,8 +327,9 @@ def evaluate(
             hidden_states, target_probs, offset = load_trace(path)
             hidden_states = [t.to(next(model.parameters()).device) for t in hidden_states]
             target_probs = [t.to(next(model.parameters()).device) for t in target_probs]
-            hidden_slice = hidden_states[offset : offset + len(target_probs) + 1]
-            probs_slice = target_probs[: len(hidden_slice) - 1]
+            hidden_slice, probs_slice = slice_trace_window(
+                hidden_states, target_probs, offset, max_pairs=model.cfg.layers
+            )
             draft_out = model(hidden_slice, teacher_force_context=teacher_force_context)
             losses = draft_losses(draft_out, hidden_slice, probs_slice, align_lambda=align_lambda)
             metrics = routing_metrics(draft_out["route_probs"], probs_slice, model.cfg.top_k)
@@ -394,8 +443,7 @@ def main() -> None:
             hidden_states, target_probs, offset = load_trace(path)
             hidden_states = [t.to(device) for t in hidden_states]
             target_probs = [t.to(device) for t in target_probs]
-            hidden_slice = hidden_states[offset : offset + len(target_probs) + 1]
-            probs_slice = target_probs[: len(hidden_slice) - 1]
+            hidden_slice, probs_slice = slice_trace_window(hidden_states, target_probs, offset, max_pairs=model.cfg.layers)
             draft_out = model(hidden_slice, teacher_force_context=args.teacher_force_context)
             losses = draft_losses(draft_out, hidden_slice, probs_slice, args.align_lambda)
             total_loss = total_loss + losses["loss"]
