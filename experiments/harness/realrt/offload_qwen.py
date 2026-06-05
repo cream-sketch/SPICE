@@ -1,0 +1,305 @@
+"""REAL offloaded-MoE decode for Qwen1.5-MoE (NOT a simulator).
+
+Stage 1: routed experts live in CPU pinned RAM; a fixed GPU LRU cache holds a
+subset; the REAL Qwen2MoE router decides top-k each token; missing experts are
+fetched on-demand (H2D) or CPU-served; shared expert stays GPU-resident.
+Attention + router + shared expert are stock (unchanged) -> output is exact.
+
+This file: model load, expert offload (CPU pinned bank + GPU LRU cache), patched
+MoE forward (policies: on_demand_fetch / cpu_serve), manual decode loop, exactness
+check (vs full-resident reference, max_logit_diff), and per-token TPOT.
+
+Bilingual note: 真实 offload 解码,非模拟器;routed 专家在 CPU pinned,GPU LRU cache。
+"""
+from __future__ import annotations
+
+import argparse
+import time
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# ---------- expert offload: CPU pinned bank + GPU LRU cache ----------
+
+class ExpertBank:
+    """CPU pinned weights for ALL routed experts, keyed by (layer, expert)."""
+    def __init__(self):
+        self.w = {}  # (layer, eid) -> (gate_w, up_w, down_w) pinned CPU bf16
+
+    def add(self, layer, eid, gate_w, up_w, down_w):
+        self.w[(layer, eid)] = (
+            gate_w.detach().to("cpu", torch.bfloat16).contiguous().pin_memory(),
+            up_w.detach().to("cpu", torch.bfloat16).contiguous().pin_memory(),
+            down_w.detach().to("cpu", torch.bfloat16).contiguous().pin_memory(),
+        )
+
+    def get(self, layer, eid):
+        return self.w[(layer, eid)]
+
+
+class GpuExpertCache:
+    """Fixed-size LRU of GPU expert weight slots, preallocated (no per-token alloc)."""
+    def __init__(self, capacity, d_model, d_inter, dev, dtype, h2d_stream):
+        self.cap = capacity
+        self.dev = dev
+        self.h2d = h2d_stream
+        self.free = list(range(capacity))
+        self.slots = [(
+            torch.empty(d_inter, d_model, device=dev, dtype=dtype),  # gate
+            torch.empty(d_inter, d_model, device=dev, dtype=dtype),  # up
+            torch.empty(d_model, d_inter, device=dev, dtype=dtype),  # down
+        ) for _ in range(capacity)]
+        self.map = {}          # (layer,eid) -> slot_id
+        self.lru = []          # slot_ids, most-recent last
+        self.ready = [None] * capacity  # cuda event per slot
+        self.stats = {"hit": 0, "miss": 0, "evict": 0}
+
+    def _evict(self):
+        sid = self.lru.pop(0)
+        key = next(k for k, v in self.map.items() if v == sid)
+        del self.map[key]
+        self.stats["evict"] += 1
+        return sid
+
+    def get_or_fetch(self, layer, eid, bank, prefetch=False):
+        """Return (slot, hit). On miss, async H2D from bank on the h2d stream."""
+        key = (layer, eid)
+        if key in self.map:
+            sid = self.map[key]
+            self.lru.remove(sid); self.lru.append(sid)
+            if not prefetch:
+                self.stats["hit"] += 1
+            return self.slots[sid], True
+        # miss
+        if not prefetch:
+            self.stats["miss"] += 1
+        sid = self.free.pop() if self.free else self._evict()
+        self.map[key] = sid; self.lru.append(sid)
+        gw, uw, dw = bank.get(layer, eid)
+        with torch.cuda.stream(self.h2d):
+            self.slots[sid][0].copy_(gw, non_blocking=True)
+            self.slots[sid][1].copy_(uw, non_blocking=True)
+            self.slots[sid][2].copy_(dw, non_blocking=True)
+            ev = torch.cuda.Event(); ev.record(self.h2d)
+        self.ready[sid] = ev
+        return self.slots[sid], False
+
+    def slot_ready_event(self, layer, eid):
+        sid = self.map.get((layer, eid))
+        return self.ready[sid] if sid is not None else None
+
+
+def _swiglu(x, gate_w, up_w, down_w):
+    return F.linear(F.silu(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+
+
+# ---------- patched Qwen2MoE forward ----------
+
+def make_patched_forward(block, layer_idx, rt):
+    """Return a forward for Qwen2MoeSparseMoeBlock using offloaded routed experts."""
+    gate = block.gate
+    shared_expert = block.shared_expert
+    shared_gate = block.shared_expert_gate
+    top_k = block.top_k
+    norm_topk = block.norm_topk_prob
+
+    def forward(hidden_states):
+        b, s, d = hidden_states.shape
+        x = hidden_states.view(-1, d)
+        router_logits = gate(x)
+        routing = F.softmax(router_logits, dim=-1, dtype=torch.float)
+        topk_w, topk_i = torch.topk(routing, top_k, dim=-1)
+        if norm_topk:
+            topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
+        topk_w = topk_w.to(x.dtype)
+        shared = shared_expert(x)
+        shared = F.sigmoid(shared_gate(x)) * shared
+        if rt.draft_mode:
+            # DRAFT pass: record predicted top-k (last token only for decode) + issue prefetch;
+            # propagate hidden with SHARED EXPERT ONLY (the validated training-free surrogate),
+            # do NOT run routed experts. 仅 shared-only 传播 + 记录预测 + 预取.
+            rt.on_forecast(layer_idx, topk_i[-1].tolist())
+            return shared.view(b, s, d), router_logits
+        out = torch.zeros_like(x)
+        for t in range(x.shape[0]):
+            xt = x[t:t+1]
+            for j in range(top_k):
+                eid = int(topk_i[t, j]); w = topk_w[t, j]
+                y = rt.run_expert(layer_idx, eid, xt)
+                out[t:t+1] += w * y
+        out = out + shared
+        return out.view(b, s, d), router_logits
+    return forward
+
+
+class Runtime:
+    def __init__(self, bank, cache, dev, policy):
+        self.bank = bank; self.cache = cache; self.dev = dev; self.policy = policy
+        self.draft_mode = False
+
+    def on_forecast(self, layer, eids):
+        """Draft forward predicted these experts for `layer` -> stage them now (low-stream H2D)."""
+        if self.policy != "gos_transient":
+            return
+        for eid in eids:
+            self.cache.get_or_fetch(layer, eid, self.bank, prefetch=True)
+
+    def run_expert(self, layer, eid, xt):
+        if self.policy == "cpu_serve":
+            gw, uw, dw = self.bank.get(layer, eid)
+            return _swiglu(xt.to("cpu", torch.bfloat16), gw, uw, dw).to(self.dev)
+        # on_demand_fetch / gos_transient: GPU cache. On a (prefetched) hit OR a fresh miss the
+        # slot may have an in-flight H2D -> wait on its ready event before computing.
+        (gw, uw, dw), _hit = self.cache.get_or_fetch(layer, eid, self.bank)
+        ev = self.cache.slot_ready_event(layer, eid)
+        if ev is not None:
+            torch.cuda.current_stream(self.dev).wait_event(ev)
+        return _swiglu(xt, gw, uw, dw)
+
+
+# ---------- offload setup ----------
+
+def offload_experts(model, dev):
+    """Move routed experts to a CPU pinned bank; return (bank, d_model, d_inter, n_layers, n_exp)."""
+    bank = ExpertBank()
+    layers = model.model.layers
+    d_model = model.config.hidden_size
+    d_inter = model.config.moe_intermediate_size
+    n_exp = model.config.num_experts
+    for li, layer in enumerate(layers):
+        mlp = layer.mlp
+        for eid, exp in enumerate(mlp.experts):
+            bank.add(li, eid, exp.gate_proj.weight, exp.up_proj.weight, exp.down_proj.weight)
+        # free GPU expert params (replace experts with an empty list-like to drop refs)
+        mlp.experts = torch.nn.ModuleList()
+    torch.cuda.empty_cache()
+    return bank, d_model, d_inter, len(layers), n_exp
+
+
+def patch_model(model, rt):
+    for li, layer in enumerate(model.model.layers):
+        layer.mlp.forward = make_patched_forward(layer.mlp, li, rt)
+
+
+# ---------- decode loop + exactness + TPOT ----------
+
+@torch.inference_mode()
+def reference_logits(model, input_ids, n_tokens):
+    """Full-resident greedy decode; return chosen token ids + per-step last logits."""
+    out = model(input_ids=input_ids, use_cache=True)
+    kv = out.past_key_values
+    logits = [out.logits[:, -1, :].float().cpu()]
+    ids = [int(out.logits[:, -1, :].argmax(-1))]
+    cur = torch.tensor([[ids[-1]]], device=input_ids.device)
+    for _ in range(n_tokens - 1):
+        out = model(input_ids=cur, past_key_values=kv, use_cache=True)
+        kv = out.past_key_values
+        logits.append(out.logits[:, -1, :].float().cpu())
+        ids.append(int(out.logits[:, -1, :].argmax(-1)))
+        cur = torch.tensor([[ids[-1]]], device=input_ids.device)
+    return ids, logits
+
+
+@torch.inference_mode()
+def replay_logits(model, input_ids, token_ids):
+    """Teacher-forced replay of token_ids; return per-step last logits (for exactness)."""
+    out = model(input_ids=input_ids, use_cache=True)
+    kv = out.past_key_values
+    logits = [out.logits[:, -1, :].float().cpu()]
+    for tid in token_ids[:-1]:
+        cur = torch.tensor([[tid]], device=input_ids.device)
+        out = model(input_ids=cur, past_key_values=kv, use_cache=True)
+        kv = out.past_key_values
+        logits.append(out.logits[:, -1, :].float().cpu())
+    return logits
+
+
+@torch.inference_mode()
+def timed_decode(model, input_ids, token_ids, warmup, dev):
+    """Replay token_ids; measure per-token TPOT over the post-warmup window."""
+    out = model(input_ids=input_ids, use_cache=True); kv = out.past_key_values
+    seq = token_ids
+    for k, tid in enumerate(seq):
+        if k == warmup:
+            torch.cuda.synchronize(dev); t0 = time.perf_counter()
+        cur = torch.tensor([[tid]], device=dev)
+        out = model(input_ids=cur, past_key_values=kv, use_cache=True); kv = out.past_key_values
+    torch.cuda.synchronize(dev)
+    measured = len(seq) - warmup
+    return (time.perf_counter() - t0) * 1000.0 / max(1, measured)
+
+
+@torch.inference_mode()
+def timed_decode_gos(model, rt, input_ids, token_ids, warmup, dev):
+    """GOS: per token run a SHALLOW-ONLY draft forward (separate KV) that forecasts + prefetches
+    future experts, then the REAL forward (gos policy) consuming staged experts. Both counted."""
+    rt.draft_mode = True
+    draft_kv = model(input_ids=input_ids, use_cache=True).past_key_values
+    rt.draft_mode = False
+    real_kv = model(input_ids=input_ids, use_cache=True).past_key_values
+    for k, tid in enumerate(token_ids):
+        if k == warmup:
+            torch.cuda.synchronize(dev); t0 = time.perf_counter()
+        cur = torch.tensor([[tid]], device=dev)
+        rt.draft_mode = True   # draft forward: shared-only, fills forecast + issues prefetch
+        draft_kv = model(input_ids=cur, past_key_values=draft_kv, use_cache=True).past_key_values
+        rt.draft_mode = False  # real forward: gos consumes staged experts
+        real_kv = model(input_ids=cur, past_key_values=real_kv, use_cache=True).past_key_values
+    torch.cuda.synchronize(dev)
+    measured = len(token_ids) - warmup
+    return (time.perf_counter() - t0) * 1000.0 / max(1, measured)
+
+
+def main():
+    p = argparse.ArgumentParser(description="REAL offloaded Qwen1.5-MoE decode (stage 1)")
+    p.add_argument("--model_dir", required=True)
+    p.add_argument("--gpu", type=int, required=True)
+    p.add_argument("--prompt", default="The history of mixture-of-experts models in large language modeling")
+    p.add_argument("--decode_tokens", type=int, default=16)
+    p.add_argument("--warmup", type=int, default=4)
+    p.add_argument("--cache_experts", type=int, required=True, help="GPU resident expert-cache capacity")
+    p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient"], default="on_demand_fetch")
+    p.add_argument("--cpu_threads", type=int, default=16)
+    p.add_argument("--check_exact", action="store_true")
+    args = p.parse_args()
+
+    torch.set_num_threads(args.cpu_threads)
+    dev = torch.device(f"cuda:{args.gpu}")
+    torch.cuda.set_device(dev)
+    tok = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_dir, torch_dtype=torch.bfloat16, local_files_only=True, low_cpu_mem_usage=True,
+    ).to(dev).eval()
+    ids = tok(args.prompt, return_tensors="pt").input_ids.to(dev)
+
+    # reference (full-resident) decode -> token ids + reference logits
+    ref_ids, ref_logits = reference_logits(model, ids, args.decode_tokens)
+
+    # offload + patch
+    bank, d_model, d_inter, n_layers, n_exp = offload_experts(model, dev)
+    h2d = torch.cuda.Stream(device=dev)
+    cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
+    rt = Runtime(bank, cache, dev, args.policy)
+    patch_model(model, rt)
+
+    if args.check_exact:
+        rep = replay_logits(model, ids, ref_ids)
+        maxdiff = max(float((a - b).abs().max()) for a, b in zip(ref_logits, rep))
+        argmatch = all(int(a.argmax(-1)) == int(b.argmax(-1)) for a, b in zip(ref_logits, rep))
+        print(f"[exact] policy={args.policy} max_logit_diff={maxdiff:.6f} argmax_match={argmatch} "
+              f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
+
+    cache.stats.update(hit=0, miss=0, evict=0)  # reset after exactness replay
+    if args.policy == "gos_transient":
+        tpot = timed_decode_gos(model, rt, ids, ref_ids, args.warmup, dev)
+    else:
+        tpot = timed_decode(model, ids, ref_ids, args.warmup, dev)
+    print(f"[tpot] policy={args.policy} cache_experts={args.cache_experts} "
+          f"n_layers={n_layers} n_exp={n_exp} TPOT_ms={tpot:.3f} "
+          f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
+
+
+if __name__ == "__main__":
+    main()
