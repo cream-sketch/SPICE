@@ -100,14 +100,19 @@ def main():
     n = len(flips); nflip = sum(flips)
     print(f"[lowbit] bits={args.bits} group={args.group_size} experts_quantized={nq} tokens={n} "
           f"flip_rate={nflip/n:.4f} ({nflip}/{n})")
-    # certificate sweep: among tokens with low-bit margin > tau, how many flipped, and frac kept
+    # certificate sweep: among tokens with low-bit margin > tau, how many flipped, and frac kept.
+    # HONEST eff_PCIe for exactness-preserving "low-bit-first, then full re-fetch on uncertain":
+    # the margin is only known AFTER fetching low-bit, so EVERY token pays low-bit (1/ratio); the
+    # (1-frac_safe) uncertain tokens additionally re-fetch full (+1). avg_bytes = 1/ratio + (1-frac_safe).
+    # (The earlier 1/(frac_safe/ratio + (1-frac_safe)) was optimistic: it assumed safe tokens skip the
+    #  full fetch WITHOUT first paying low-bit, which is not realizable. Caveat: a re-fetched token also
+    #  needs its KV/state recomputed at full precision to be truly exact -- not modeled here.)
+    ratio = 16 / args.bits
     for tau in [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]:
         safe = [i for i in range(n) if lb_margins[i] > tau]
         flip_in_safe = sum(flips[i] for i in safe)
         frac_safe = len(safe) / n
-        # effective PCIe if "safe" tokens use low-bit (1/bits_ratio) and the rest re-fetch full
-        ratio = 16 / args.bits
-        eff = 1.0 / (frac_safe / ratio + (1 - frac_safe)) if frac_safe < 1 else ratio
+        eff = 1.0 / (1.0 / ratio + (1 - frac_safe))
         print(f"  tau={tau:4.1f}  frac_safe={frac_safe:.3f}  flips_in_safe={flip_in_safe}  eff_PCIe={eff:.2f}x")
 
 

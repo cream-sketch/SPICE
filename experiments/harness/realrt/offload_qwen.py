@@ -139,7 +139,7 @@ class Runtime:
 
     def run_experts(self, layer, eids, x0, probs):
         """Compute sum_k probs_k * expert_k(x0) for the top-k experts of one token.
-        x0: [d_model]; probs: [k]. Batched grouped GEMM (Fix A: no python per-expert loop)."""
+        x0: [d_model]; probs: [k]."""
         if self.policy == "cpu_serve":
             xc = x0.unsqueeze(0).to("cpu", torch.bfloat16)
             acc = None
@@ -148,6 +148,26 @@ class Runtime:
                 y = _swiglu(xc, gw, uw, dw)[0] * w
                 acc = y if acc is None else acc + y
             return acc.to(self.dev)
+        if self.policy == "hybrid_resident_cpu":
+            # resource-DAG: resident (popular) experts -> GPU (0 PCIe); the rest -> CPU-serve.
+            # No fetch, no eviction during timing (the resident set is pre-warmed by popularity).
+            cur = torch.cuda.current_stream(self.dev)
+            x1 = x0.unsqueeze(0)
+            out = None
+            for eid, w in zip(eids, probs.tolist()):
+                sid = self.cache.map.get((layer, eid))
+                if sid is not None:                       # resident hit -> GPU
+                    self.cache.stats["hit"] += 1
+                    ev = self.cache.ready[sid]
+                    if ev is not None:
+                        cur.wait_event(ev)
+                    y = _swiglu(x1, self.cache.gate[sid], self.cache.up[sid], self.cache.down[sid])[0] * w
+                else:                                     # miss -> CPU serve (no PCIe)
+                    self.cache.stats["miss"] += 1
+                    gw, uw, dw = self.bank.get(layer, eid)
+                    y = _swiglu(x1.to("cpu", torch.bfloat16), gw, uw, dw)[0].to(self.dev) * w
+                out = y if out is None else out + y
+            return out
         # on_demand_fetch / gos_transient: per-expert F.linear from the contiguous cache.
         # (cuBLAS F.linear matches the stock Qwen MoE accumulation -> argmax-exact; a batched
         # einsum was tried but its bf16 reduction flipped argmax, and the runtime is H2D-bound
@@ -258,6 +278,39 @@ def timed_decode_gos(model, rt, input_ids, token_ids, warmup, dev):
     return (time.perf_counter() - t0) * 1000.0 / max(1, measured)
 
 
+@torch.inference_mode()
+def count_expert_freq(model, input_ids, token_ids):
+    """Count (layer, expert) routing frequency over the reference decode (full model, gate hooks)
+    -> popularity for warming the resident set."""
+    from collections import defaultdict
+    freq = defaultdict(int); handles = []
+
+    def mk(li, tk):
+        def hook(m, inp, out):
+            for e in out.float().topk(tk, dim=-1).indices.view(-1).tolist():
+                freq[(li, e)] += 1
+        return hook
+
+    for li, layer in enumerate(model.model.layers):
+        mlp = layer.mlp
+        if hasattr(mlp, "experts") and len(mlp.experts) > 0:
+            handles.append(mlp.gate.register_forward_hook(mk(li, mlp.top_k)))
+    replay_logits(model, input_ids, token_ids)
+    for h in handles:
+        h.remove()
+    return freq
+
+
+def warm_resident(cache, bank, freq, cap):
+    """Load the top-`cap` most popular experts into the resident cache (one-time fetch)."""
+    top = sorted(freq.items(), key=lambda kv: -kv[1])[:cap]
+    for (li, e), _c in top:
+        cache.get_slot(li, e, bank, prefetch=True)
+    torch.cuda.synchronize(cache.dev)
+    cache.stats.update(hit=0, miss=0, evict=0)
+    return len(top)
+
+
 def main():
     p = argparse.ArgumentParser(description="REAL offloaded Qwen1.5-MoE decode (stage 1)")
     p.add_argument("--model_dir", required=True)
@@ -266,9 +319,15 @@ def main():
     p.add_argument("--decode_tokens", type=int, default=16)
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--cache_experts", type=int, required=True, help="GPU resident expert-cache capacity")
-    p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient"], default="on_demand_fetch")
+    p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient", "hybrid_resident_cpu"], default="on_demand_fetch")
     p.add_argument("--cpu_threads", type=int, default=16)
     p.add_argument("--check_exact", action="store_true")
+    p.add_argument("--calib_prompt", default="In economics, the theory of comparative advantage explains how nations",
+                   help="hybrid only: a DIFFERENT text used to estimate static expert popularity "
+                        "(deployable proxy; avoids same-sequence oracle leakage)")
+    p.add_argument("--oracle_resident", action="store_true",
+                   help="hybrid only: estimate popularity on the EVAL sequence itself (oracle "
+                        "upper bound, NOT deployable). Default uses --calib_prompt (honest).")
     args = p.parse_args()
 
     torch.set_num_threads(args.cpu_threads)
@@ -282,6 +341,16 @@ def main():
 
     # reference (full-resident) decode -> token ids + reference logits
     ref_ids, ref_logits = reference_logits(model, ids, args.decode_tokens)
+    # hybrid popularity source: honest (separate calibration text) by default; oracle (eval seq) only
+    # under --oracle_resident. Both must run BEFORE offload (need full GPU experts + gate hooks).
+    freq = None
+    if args.policy == "hybrid_resident_cpu":
+        if args.oracle_resident:
+            freq = count_expert_freq(model, ids, ref_ids)
+        else:
+            calib_in = tok(args.calib_prompt, return_tensors="pt").input_ids.to(dev)
+            calib_ids, _ = reference_logits(model, calib_in, args.decode_tokens)
+            freq = count_expert_freq(model, calib_in, calib_ids)
 
     # offload + patch
     bank, d_model, d_inter, n_layers, n_exp = offload_experts(model, dev)
@@ -289,6 +358,10 @@ def main():
     cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
     rt = Runtime(bank, cache, dev, args.policy)
     patch_model(model, rt)
+    if args.policy == "hybrid_resident_cpu":
+        nres = warm_resident(cache, bank, freq, args.cache_experts)
+        src = "ORACLE(eval-seq)" if args.oracle_resident else "calib-text(honest)"
+        print(f"[hybrid] warmed {nres} popular experts resident on GPU (popularity={src}); rest CPU-served")
 
     if args.check_exact:
         rep = replay_logits(model, ids, ref_ids)
