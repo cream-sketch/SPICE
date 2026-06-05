@@ -188,6 +188,25 @@ class Decompressor:
         self.ring = ring
         self._r = 0
 
+    def deep_prefetch(self, cache, pairs):
+        """Deep-pipeline prefetch of a whole token's experts (ordered [(layer,eid)]). Issue copy_i
+        one step ahead of decode_{i-1} so H2D overlaps decode continuously (depth not limited to a
+        layer's 4 experts). Forecast/oracle supplies `pairs` ahead of the per-layer routing barrier."""
+        work = []
+        for layer, eid in pairs:
+            sid, hit = cache.alloc_slot(layer, eid)
+            if not hit:
+                work.append((sid, layer, eid))
+        rns = [None] * len(work)
+        for i in range(len(work) + 1):
+            if i < len(work):
+                _, layer, eid = work[i]
+                rns[i] = self.stage_copy(layer, eid)
+            if i >= 1:
+                sid, _, _ = work[i - 1]
+                r, n = rns[i - 1]
+                self.stage_decode(cache, sid, r, n)
+
     def stage_copy(self, layer, eid):
         """Phase A: issue async H2D of one compressed blob on the copy stream. Return its ring slot."""
         r = self._r; self._r = (self._r + 1) % self.ring
@@ -325,6 +344,23 @@ class Runtime:
                 return gpu_out
             cpu_out = fut.result().to(self.dev, non_blocking=True)   # blocks main; GPU ran meanwhile
             return cpu_out if gpu_out is None else gpu_out + cpu_out
+        if self.policy == "compressed_prefetch":
+            # consume the deep-prefetched cache (filled per-token from forecast/oracle routing).
+            # Hits = prefetched in time (free); misses = forecast wrong/late -> urgent compressed fetch.
+            cur = torch.cuda.current_stream(self.dev)
+            x1 = x0.unsqueeze(0)
+            out = None
+            for eid, w in zip(eids, probs.tolist()):
+                sid, hit = self.cache.alloc_slot(layer, eid)
+                if not hit:
+                    r, n = self.decomp.stage_copy(layer, eid)
+                    self.decomp.stage_decode(self.cache, sid, r, n)
+                ev = self.cache.ready[sid]
+                if ev is not None:
+                    cur.wait_event(ev)
+                y = _swiglu(x1, self.cache.gate[sid], self.cache.up[sid], self.cache.down[sid])[0] * w
+                out = y if out is None else out + y
+            return out
         if self.policy == "compressed_fetch":
             # lossless compressed transfer + pipelined GPU decode. SOFTWARE-PIPELINE the layer's
             # misses: issue ALL H2D copies first (copy stream), THEN all decodes (decode stream,
@@ -459,6 +495,51 @@ def timed_decode_gos(model, rt, input_ids, token_ids, warmup, dev):
 
 
 @torch.inference_mode()
+def capture_token_routing(model, input_ids, token_ids):
+    """Teacher-forced replay recording, per decode step, the ordered [(layer, eid)] routed experts
+    (oracle = the true routes). Used to drive deep prefetch ahead of the per-layer routing barrier."""
+    cur = []
+    handles = []
+
+    def mk(li, tk):
+        def hook(m, inp, out):
+            for e in out[-1].float().topk(tk).indices.tolist():   # last token's top-k
+                cur.append((li, int(e)))
+        return hook
+
+    for li, layer in enumerate(model.model.layers):
+        mlp = layer.mlp
+        if hasattr(mlp, "experts") and len(mlp.experts) > 0:
+            handles.append(mlp.gate.register_forward_hook(mk(li, mlp.top_k)))
+    out = model(input_ids=input_ids, use_cache=True); kv = out.past_key_values
+    cur.clear()                                       # discard prefill (untimed); align to decode
+    routing = []
+    for tid in token_ids:
+        c = torch.tensor([[tid]], device=input_ids.device)
+        out = model(input_ids=c, past_key_values=kv, use_cache=True); kv = out.past_key_values
+        routing.append(list(cur)); cur.clear()        # routing[k] = experts when forwarding token_ids[k]
+    for h in handles:
+        h.remove()
+    return routing
+
+
+@torch.inference_mode()
+def timed_decode_cprefetch(model, rt, input_ids, token_ids, routing, warmup, dev):
+    """Per token: deep-prefetch the whole token's experts (from `routing`) then run the real forward
+    which consumes the prefetched cache. Measures per-token TPOT over the post-warmup window."""
+    out = model(input_ids=input_ids, use_cache=True); kv = out.past_key_values  # prefill, untimed
+    for k, tid in enumerate(token_ids):
+        if k == warmup:
+            torch.cuda.synchronize(dev); t0 = time.perf_counter()
+        rt.decomp.deep_prefetch(rt.cache, routing[k])     # deep pipeline this token's experts
+        c = torch.tensor([[tid]], device=dev)
+        out = model(input_ids=c, past_key_values=kv, use_cache=True); kv = out.past_key_values
+    torch.cuda.synchronize(dev)
+    measured = len(token_ids) - warmup
+    return (time.perf_counter() - t0) * 1000.0 / max(1, measured)
+
+
+@torch.inference_mode()
 def count_expert_freq(model, input_ids, token_ids):
     """Count (layer, expert) routing frequency over the reference decode (full model, gate hooks)
     -> popularity for warming the resident set."""
@@ -505,8 +586,8 @@ def main():
     p.add_argument("--mem_reserve_gb", type=float, default=2.0,
                    help="GB reserved within the budget for KV-cache/activations/workspace")
     p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient",
-                                        "hybrid_resident_cpu", "compressed_fetch", "split_cpu_gpu"],
-                   default="on_demand_fetch")
+                                        "hybrid_resident_cpu", "compressed_fetch", "split_cpu_gpu",
+                                        "compressed_prefetch"], default="on_demand_fetch")
     p.add_argument("--split_g", type=float, default=0.5,
                    help="split_cpu_gpu: fraction of each token's top-k experts served by GPU "
                         "(rest CPU-served concurrently); g=0 -> all CPU, g=1 -> all GPU")
@@ -541,11 +622,13 @@ def main():
             calib_in = tok(args.calib_prompt, return_tensors="pt").input_ids.to(dev)
             calib_ids, _ = reference_logits(model, calib_in, args.decode_tokens)
             freq = count_expert_freq(model, calib_in, calib_ids)
+    # oracle per-token routing for deep prefetch (capture BEFORE offload, needs true experts)
+    routing = capture_token_routing(model, ids, ref_ids) if args.policy == "compressed_prefetch" else None
 
     # offload + patch
-    if args.policy == "compressed_fetch":
+    if args.policy in ("compressed_fetch", "compressed_prefetch"):
         if nvcomp is None:
-            raise RuntimeError("compressed_fetch requires nvidia-nvcomp-cu12 (not installed)")
+            raise RuntimeError("compressed policies require nvidia-nvcomp-cu12 (not installed)")
         nv0 = nvcomp.CudaStream.make_new(args.gpu)
         codec0 = nvcomp.Codec(algorithm="ANS", device_id=args.gpu, cuda_stream=nv0.ptr, data_type="|u1")
         cbank, d_model, d_inter, n_layers, n_exp = compress_experts(model, dev, codec0, nv0.ptr)
@@ -566,7 +649,10 @@ def main():
             print(f"[exact] policy={args.policy} max_logit_diff={maxdiff:.6f} argmax_match={argmatch} "
                   f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
         cache.stats.update(hit=0, miss=0, evict=0)
-        tpot = timed_decode(model, ids, ref_ids, args.warmup, dev)
+        if args.policy == "compressed_prefetch":
+            tpot = timed_decode_cprefetch(model, rt, ids, ref_ids, routing, args.warmup, dev)
+        else:
+            tpot = timed_decode(model, ids, ref_ids, args.warmup, dev)
         print(f"[tpot] policy={args.policy} cache_experts={args.cache_experts} "
               f"n_layers={n_layers} n_exp={n_exp} TPOT_ms={tpot:.3f} "
               f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
