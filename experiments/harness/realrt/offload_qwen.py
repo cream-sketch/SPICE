@@ -40,17 +40,16 @@ class ExpertBank:
 
 
 class GpuExpertCache:
-    """Fixed-size LRU of GPU expert weight slots, preallocated (no per-token alloc)."""
+    """Fixed-size LRU expert cache as CONTIGUOUS GPU tensors (so the top-k experts can be
+    gathered + computed in ONE grouped GEMM per layer instead of a python per-expert loop)."""
     def __init__(self, capacity, d_model, d_inter, dev, dtype, h2d_stream):
         self.cap = capacity
         self.dev = dev
         self.h2d = h2d_stream
         self.free = list(range(capacity))
-        self.slots = [(
-            torch.empty(d_inter, d_model, device=dev, dtype=dtype),  # gate
-            torch.empty(d_inter, d_model, device=dev, dtype=dtype),  # up
-            torch.empty(d_model, d_inter, device=dev, dtype=dtype),  # down
-        ) for _ in range(capacity)]
+        self.gate = torch.empty(capacity, d_inter, d_model, device=dev, dtype=dtype)
+        self.up = torch.empty(capacity, d_inter, d_model, device=dev, dtype=dtype)
+        self.down = torch.empty(capacity, d_model, d_inter, device=dev, dtype=dtype)
         self.map = {}          # (layer,eid) -> slot_id
         self.lru = []          # slot_ids, most-recent last
         self.ready = [None] * capacity  # cuda event per slot
@@ -63,32 +62,27 @@ class GpuExpertCache:
         self.stats["evict"] += 1
         return sid
 
-    def get_or_fetch(self, layer, eid, bank, prefetch=False):
-        """Return (slot, hit). On miss, async H2D from bank on the h2d stream."""
+    def get_slot(self, layer, eid, bank, prefetch=False):
+        """Return slot_id. On miss, async H2D from the pinned bank on the h2d stream."""
         key = (layer, eid)
         if key in self.map:
             sid = self.map[key]
             self.lru.remove(sid); self.lru.append(sid)
             if not prefetch:
                 self.stats["hit"] += 1
-            return self.slots[sid], True
-        # miss
+            return sid
         if not prefetch:
             self.stats["miss"] += 1
         sid = self.free.pop() if self.free else self._evict()
         self.map[key] = sid; self.lru.append(sid)
         gw, uw, dw = bank.get(layer, eid)
         with torch.cuda.stream(self.h2d):
-            self.slots[sid][0].copy_(gw, non_blocking=True)
-            self.slots[sid][1].copy_(uw, non_blocking=True)
-            self.slots[sid][2].copy_(dw, non_blocking=True)
+            self.gate[sid].copy_(gw, non_blocking=True)
+            self.up[sid].copy_(uw, non_blocking=True)
+            self.down[sid].copy_(dw, non_blocking=True)
             ev = torch.cuda.Event(); ev.record(self.h2d)
         self.ready[sid] = ev
-        return self.slots[sid], False
-
-    def slot_ready_event(self, layer, eid):
-        sid = self.map.get((layer, eid))
-        return self.ready[sid] if sid is not None else None
+        return sid
 
 
 def _swiglu(x, gate_w, up_w, down_w):
@@ -123,12 +117,9 @@ def make_patched_forward(block, layer_idx, rt):
             rt.on_forecast(layer_idx, topk_i[-1].tolist())
             return shared.view(b, s, d), router_logits
         out = torch.zeros_like(x)
-        for t in range(x.shape[0]):
-            xt = x[t:t+1]
-            for j in range(top_k):
-                eid = int(topk_i[t, j]); w = topk_w[t, j]
-                y = rt.run_expert(layer_idx, eid, xt)
-                out[t:t+1] += w * y
+        for t in range(x.shape[0]):  # 1 iter in decode (s==1); prefill loops tokens
+            eids = [int(topk_i[t, j]) for j in range(top_k)]
+            out[t] = rt.run_experts(layer_idx, eids, x[t], topk_w[t])
         out = out + shared
         return out.view(b, s, d), router_logits
     return forward
@@ -144,19 +135,34 @@ class Runtime:
         if self.policy != "gos_transient":
             return
         for eid in eids:
-            self.cache.get_or_fetch(layer, eid, self.bank, prefetch=True)
+            self.cache.get_slot(layer, eid, self.bank, prefetch=True)
 
-    def run_expert(self, layer, eid, xt):
+    def run_experts(self, layer, eids, x0, probs):
+        """Compute sum_k probs_k * expert_k(x0) for the top-k experts of one token.
+        x0: [d_model]; probs: [k]. Batched grouped GEMM (Fix A: no python per-expert loop)."""
         if self.policy == "cpu_serve":
-            gw, uw, dw = self.bank.get(layer, eid)
-            return _swiglu(xt.to("cpu", torch.bfloat16), gw, uw, dw).to(self.dev)
-        # on_demand_fetch / gos_transient: GPU cache. On a (prefetched) hit OR a fresh miss the
-        # slot may have an in-flight H2D -> wait on its ready event before computing.
-        (gw, uw, dw), _hit = self.cache.get_or_fetch(layer, eid, self.bank)
-        ev = self.cache.slot_ready_event(layer, eid)
-        if ev is not None:
-            torch.cuda.current_stream(self.dev).wait_event(ev)
-        return _swiglu(xt, gw, uw, dw)
+            xc = x0.unsqueeze(0).to("cpu", torch.bfloat16)
+            acc = None
+            for eid, w in zip(eids, probs.tolist()):
+                gw, uw, dw = self.bank.get(layer, eid)
+                y = _swiglu(xc, gw, uw, dw)[0] * w
+                acc = y if acc is None else acc + y
+            return acc.to(self.dev)
+        # on_demand_fetch / gos_transient: per-expert F.linear from the contiguous cache.
+        # (cuBLAS F.linear matches the stock Qwen MoE accumulation -> argmax-exact; a batched
+        # einsum was tried but its bf16 reduction flipped argmax, and the runtime is H2D-bound
+        # at batch=1 so batching gave no speedup. Correctness-first.)
+        cur = torch.cuda.current_stream(self.dev)
+        x1 = x0.unsqueeze(0)
+        out = None
+        for eid, w in zip(eids, probs.tolist()):
+            sid = self.cache.get_slot(layer, eid, self.bank)
+            ev = self.cache.ready[sid]
+            if ev is not None:
+                cur.wait_event(ev)
+            y = _swiglu(x1, self.cache.gate[sid], self.cache.up[sid], self.cache.down[sid])[0] * w
+            out = y if out is None else out + y
+        return out
 
 
 # ---------- offload setup ----------
