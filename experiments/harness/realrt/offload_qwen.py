@@ -20,6 +20,11 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from nvidia import nvcomp   # only needed for policy=compressed_fetch
+except ImportError:
+    nvcomp = None
+
 
 # ---------- expert offload: CPU pinned bank + GPU LRU cache ----------
 
@@ -62,6 +67,20 @@ class GpuExpertCache:
         self.stats["evict"] += 1
         return sid
 
+    def alloc_slot(self, layer, eid):
+        """Slot bookkeeping only (no weight transfer). Return (slot_id, hit). For compressed_fetch,
+        the caller fills the slot via the Decompressor."""
+        key = (layer, eid)
+        if key in self.map:
+            sid = self.map[key]
+            self.lru.remove(sid); self.lru.append(sid)
+            self.stats["hit"] += 1
+            return sid, True
+        self.stats["miss"] += 1
+        sid = self.free.pop() if self.free else self._evict()
+        self.map[key] = sid; self.lru.append(sid)
+        return sid, False
+
     def get_slot(self, layer, eid, bank, prefetch=False):
         """Return slot_id. On miss, async H2D from the pinned bank on the h2d stream."""
         key = (layer, eid)
@@ -87,6 +106,101 @@ class GpuExpertCache:
 
 def _swiglu(x, gate_w, up_w, down_w):
     return F.linear(F.silu(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+
+
+# ---------- lossless compressed fetch (transfer compressed bytes, decompress on GPU, pipelined) ----------
+
+def _byteplane_split(u8):
+    """bf16 byte-plane separation on a flat uint8 stream: [..low,high..] -> cat(all_high, all_low).
+    Exposes the low-entropy sign+exponent plane so the lossless coder compresses ~1.4x."""
+    p = u8.reshape(-1, 2)
+    return torch.cat([p[:, 1].contiguous(), p[:, 0].contiguous()])
+
+
+class CompressedBank:
+    """Per-expert lossless-compressed blobs in CPU pinned RAM. One blob = ANS(byteplane(gate||up||down)).
+    gate/up/down have equal element count (d_inter*d_model); decode rebuilds all three exactly."""
+    def __init__(self):
+        self.blob = {}   # (layer,eid) -> pinned uint8 compressed
+        self.gn = None   # elements per sub-weight (gate==up==down)
+
+    def add(self, layer, eid, comp_pinned, gn):
+        self.blob[(layer, eid)] = comp_pinned
+        self.gn = gn
+
+
+def compress_experts(model, dev, codec, nv_ptr):
+    """Move routed experts off GPU as ANS-compressed pinned blobs; free GPU expert params.
+    Returns (cbank, d_model, d_inter, n_layers, n_exp)."""
+    import numpy as np
+    cbank = CompressedBank()
+    layers = model.model.layers
+    d_model = model.config.hidden_size
+    d_inter = model.config.moe_intermediate_size
+    n_exp = model.config.num_experts
+    gn = d_inter * d_model
+    for li, layer in enumerate(layers):
+        mlp = layer.mlp
+        for eid, exp in enumerate(mlp.experts):
+            u8 = torch.cat([
+                exp.gate_proj.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint8).reshape(-1),
+                exp.up_proj.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint8).reshape(-1),
+                exp.down_proj.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint8).reshape(-1),
+            ])
+            comp = codec.encode(nvcomp.as_array(_byteplane_split(u8), cuda_stream=nv_ptr))
+            host = comp.cpu()  # keep alive across from_dlpack
+            arr = np.from_dlpack(host).view(np.uint8).copy()
+            cbank.add(li, eid, torch.from_numpy(arr).pin_memory(), gn)
+        mlp.experts = torch.nn.ModuleList()
+    torch.cuda.empty_cache()
+    return cbank, d_model, d_inter, len(layers), n_exp
+
+
+class Decompressor:
+    """Pipelined compressed-fetch engine: H2D compressed blob (copy stream) overlaps GPU ANS decode
+    + un-byteplane (decode stream); decoded weights land directly in the GPU cache slot."""
+    def __init__(self, cbank, dev, ring=6):
+        self.cb = cbank
+        self.dev = dev
+        gn = cbank.gn
+        self.gn = gn
+        self.tn = 3 * gn                                  # total elements per expert
+        self.nv = nvcomp.CudaStream.make_new(dev)        # nvCOMP-owned decode stream (keep alive)
+        self.codec = nvcomp.Codec(algorithm="ANS", device_id=dev, cuda_stream=self.nv.ptr, data_type="|u1")
+        self.h2d = torch.cuda.Stream(device=dev)
+        self.ext = torch.cuda.ExternalStream(self.nv.ptr, device=dev)
+        maxblob = max(b.numel() for b in cbank.blob.values())
+        self.comp_dev = [torch.empty(maxblob, dtype=torch.uint8, device=dev) for _ in range(ring)]
+        self.split = [torch.empty(2 * self.tn, dtype=torch.uint8, device=dev) for _ in range(ring)]
+        self.split_arr = [nvcomp.as_array(s, cuda_stream=self.nv.ptr) for s in self.split]
+        self.cdone = [torch.cuda.Event() for _ in range(ring)]
+        self.ring = ring
+        self._r = 0
+
+    def stage_copy(self, layer, eid):
+        """Phase A: issue async H2D of one compressed blob on the copy stream. Return its ring slot."""
+        r = self._r; self._r = (self._r + 1) % self.ring
+        blob = self.cb.blob[(layer, eid)]
+        n = blob.numel()
+        with torch.cuda.stream(self.h2d):
+            self.comp_dev[r][:n].copy_(blob, non_blocking=True)
+            self.cdone[r].record(self.h2d)
+        return r, n
+
+    def stage_decode(self, cache, sid, r, n):
+        """Phase B: decode (gated on its copy event) + un-byteplane into cache slot `sid`; set ready."""
+        self.ext.wait_event(self.cdone[r])
+        src = nvcomp.as_array(self.comp_dev[r][:n], cuda_stream=self.nv.ptr)
+        self.codec.decode(src, data_type="|u1", out=self.split_arr[r])
+        gn, tn = self.gn, self.tn
+        with torch.cuda.stream(self.ext):
+            sp = self.split[r]
+            for k, dst in enumerate((cache.gate[sid], cache.up[sid], cache.down[sid])):
+                b = dst.view(torch.uint8).view(-1)
+                b[1::2] = sp[k * gn:(k + 1) * gn]              # high-byte plane
+                b[0::2] = sp[tn + k * gn:tn + (k + 1) * gn]    # low-byte plane
+            ev = torch.cuda.Event(); ev.record(self.ext)
+        cache.ready[sid] = ev
 
 
 # ---------- patched Qwen2MoE forward ----------
@@ -129,6 +243,7 @@ class Runtime:
     def __init__(self, bank, cache, dev, policy):
         self.bank = bank; self.cache = cache; self.dev = dev; self.policy = policy
         self.draft_mode = False
+        self.decomp = None   # Decompressor, set for compressed_fetch
 
     def on_forecast(self, layer, eids):
         """Draft forward predicted these experts for `layer` -> stage them now (low-stream H2D)."""
@@ -166,6 +281,29 @@ class Runtime:
                     self.cache.stats["miss"] += 1
                     gw, uw, dw = self.bank.get(layer, eid)
                     y = _swiglu(x1.to("cpu", torch.bfloat16), gw, uw, dw)[0].to(self.dev) * w
+                out = y if out is None else out + y
+            return out
+        if self.policy == "compressed_fetch":
+            # lossless compressed transfer + pipelined GPU decode. SOFTWARE-PIPELINE the layer's
+            # misses: issue ALL H2D copies first (copy stream), THEN all decodes (decode stream,
+            # each gated on its copy event) so copy_{i+1} overlaps decode_i; finally compute. Exact.
+            cur = torch.cuda.current_stream(self.dev)
+            x1 = x0.unsqueeze(0)
+            sids = []; staged = []
+            for eid in eids:
+                sid, hit = self.cache.alloc_slot(layer, eid)
+                sids.append(sid)
+                if not hit:
+                    r, n = self.decomp.stage_copy(layer, eid)   # phase A: all copies first
+                    staged.append((sid, r, n))
+            for sid, r, n in staged:                            # phase B: all decodes overlap copies
+                self.decomp.stage_decode(self.cache, sid, r, n)
+            out = None
+            for sid, w in zip(sids, probs.tolist()):
+                ev = self.cache.ready[sid]
+                if ev is not None:
+                    cur.wait_event(ev)
+                y = _swiglu(x1, self.cache.gate[sid], self.cache.up[sid], self.cache.down[sid])[0] * w
                 out = y if out is None else out + y
             return out
         # on_demand_fetch / gos_transient: per-expert F.linear from the contiguous cache.
@@ -319,7 +457,8 @@ def main():
     p.add_argument("--decode_tokens", type=int, default=16)
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--cache_experts", type=int, required=True, help="GPU resident expert-cache capacity")
-    p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient", "hybrid_resident_cpu"], default="on_demand_fetch")
+    p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient",
+                                        "hybrid_resident_cpu", "compressed_fetch"], default="on_demand_fetch")
     p.add_argument("--cpu_threads", type=int, default=16)
     p.add_argument("--check_exact", action="store_true")
     p.add_argument("--calib_prompt", default="In economics, the theory of comparative advantage explains how nations",
@@ -353,6 +492,34 @@ def main():
             freq = count_expert_freq(model, calib_in, calib_ids)
 
     # offload + patch
+    if args.policy == "compressed_fetch":
+        if nvcomp is None:
+            raise RuntimeError("compressed_fetch requires nvidia-nvcomp-cu12 (not installed)")
+        nv0 = nvcomp.CudaStream.make_new(args.gpu)
+        codec0 = nvcomp.Codec(algorithm="ANS", device_id=args.gpu, cuda_stream=nv0.ptr, data_type="|u1")
+        cbank, d_model, d_inter, n_layers, n_exp = compress_experts(model, dev, codec0, nv0.ptr)
+        orig = 3 * cbank.gn * 2 * len(cbank.blob)
+        comp = sum(int(b.numel()) for b in cbank.blob.values())
+        print(f"[compressed] {len(cbank.blob)} experts, lossless ratio={orig/comp:.3f} "
+              f"({comp/1e9:.2f}GB compressed vs {orig/1e9:.2f}GB bf16)")
+        bank = None
+        h2d = torch.cuda.Stream(device=dev)
+        cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
+        rt = Runtime(bank, cache, dev, args.policy)
+        rt.decomp = Decompressor(cbank, args.gpu)
+        patch_model(model, rt)
+        if args.check_exact:
+            rep = replay_logits(model, ids, ref_ids)
+            maxdiff = max(float((a - b).abs().max()) for a, b in zip(ref_logits, rep))
+            argmatch = all(int(a.argmax(-1)) == int(b.argmax(-1)) for a, b in zip(ref_logits, rep))
+            print(f"[exact] policy={args.policy} max_logit_diff={maxdiff:.6f} argmax_match={argmatch} "
+                  f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
+        cache.stats.update(hit=0, miss=0, evict=0)
+        tpot = timed_decode(model, ids, ref_ids, args.warmup, dev)
+        print(f"[tpot] policy={args.policy} cache_experts={args.cache_experts} "
+              f"n_layers={n_layers} n_exp={n_exp} TPOT_ms={tpot:.3f} "
+              f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
+        return
     bank, d_model, d_inter, n_layers, n_exp = offload_experts(model, dev)
     h2d = torch.cuda.Stream(device=dev)
     cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
