@@ -374,7 +374,8 @@ def build_stream_batch(stream: torch.Tensor, batch: int, prompt_len: int, decode
 class BatchRuntime:
     def __init__(self, bank: ExpertBank, cache: GpuExpertCache, staging: TransientStaging | None,
                  dev: torch.device, policy: str, fallback: str, max_lead: int,
-                 prefetch_per_layer: int, forecast_alignment: str) -> None:
+                 prefetch_per_layer: int, forecast_alignment: str,
+                 prefetch_budget_per_step: int) -> None:
         self.bank = bank
         self.cache = cache
         self.staging = staging
@@ -384,6 +385,8 @@ class BatchRuntime:
         self.max_lead = max_lead
         self.prefetch_per_layer = prefetch_per_layer
         self.forecast_alignment = forecast_alignment
+        self.prefetch_budget_per_step = prefetch_budget_per_step
+        self.prefetch_budget_remaining = prefetch_budget_per_step
         self.prefetch_enabled = False
         self.current_positions: list[int] = []
         self.current_forecasts: list[ForecastItem] = []
@@ -392,6 +395,7 @@ class BatchRuntime:
     def set_step(self, positions: list[int], forecasts: list[ForecastItem] | None) -> None:
         self.current_positions = positions
         self.current_forecasts = forecasts or []
+        self.prefetch_budget_remaining = self.prefetch_budget_per_step
 
     def finish_step(self) -> None:
         if self.staging is not None:
@@ -403,8 +407,7 @@ class BatchRuntime:
         if not self.current_forecasts or self.staging is None:
             return
         self.staging.expire_before(anchor_layer)
-        union: list[tuple[int, int]] = []
-        seen = set()
+        scored: dict[tuple[int, int], list[float]] = {}
         true_future_union = set()
         for pos, fc in zip(self.current_positions, self.current_forecasts):
             fcast = fc.fcast
@@ -424,18 +427,53 @@ class BatchRuntime:
                     if eid < 0:
                         continue
                     key = (target_layer, int(eid))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    union.append(key)
+                    # Score by cross-batch multiplicity and deadline.  A global
+                    # budget is useful only if the scarce PCIe slots go to
+                    # experts that are close and likely shared.
+                    if key not in scored:
+                        scored[key] = [0.0, float(h)]
+                    scored[key][0] += 1.0 / float(h)
+                    scored[key][1] = min(scored[key][1], float(h))
                     added += 1
                     if added >= self.prefetch_per_layer:
                         break
+        candidates = sorted(scored, key=lambda k: (scored[k][1], -scored[k][0], k[0], k[1]))
+        self.stats["forecast_candidate_union"] += len(candidates)
+
+        union: list[tuple[int, int]] = []
+        free_slots = len(self.staging.free)
+        budget_left = self.prefetch_budget_remaining
+        for key in candidates:
+            if key in self.cache.map:
+                self.stats["forecast_plan_skip_resident"] += 1
+                continue
+            if key in self.staging.map:
+                self.stats["forecast_plan_skip_duplicate"] += 1
+                continue
+            if free_slots <= 0:
+                self.stats["forecast_plan_drop_capacity"] += 1
+                continue
+            if budget_left >= 0 and budget_left <= 0:
+                self.stats["forecast_budget_drop"] += 1
+                continue
+            union.append(key)
+            free_slots -= 1
+            if budget_left >= 0:
+                budget_left -= 1
+
+        issued: list[tuple[int, int]] = []
         for layer, eid in union:
-            self.staging.issue(layer, eid, self.bank, self.cache)
-        self.stats["forecast_union"] += len(union)
+            if self.staging.issue(layer, eid, self.bank, self.cache):
+                issued.append((layer, eid))
+                if self.prefetch_budget_remaining >= 0:
+                    self.prefetch_budget_remaining -= 1
+            else:
+                self.stats["forecast_issue_failed_after_plan"] += 1
+        self.stats["forecast_union"] += len(issued)
+        self.stats["forecast_selected"] += len(issued)
         self.stats["forecast_true_union"] += len(true_future_union)
-        self.stats["forecast_true_positive"] += len(set(union) & true_future_union)
+        self.stats["forecast_true_positive"] += len(set(issued) & true_future_union)
+        self.stats["forecast_selected_true_positive"] += len(set(issued) & true_future_union)
 
     def run_experts_batched(self, layer: int, topk_i: torch.Tensor, topk_w: torch.Tensor,
                             x: torch.Tensor) -> torch.Tensor:
@@ -450,6 +488,7 @@ class BatchRuntime:
         self.stats["actual_unique"] += len(groups)
         self.stats["assignments"] += int(topk_i.numel())
         cur = torch.cuda.current_stream(self.dev)
+        cpu_groups: list[tuple[int, list[tuple[int, float, int]]]] = []
 
         # HF Qwen MoE accumulates by expert index order.  Keep the same expert
         # order here; the benefit still comes from grouping rows per expert.
@@ -479,7 +518,7 @@ class BatchRuntime:
 
             if self.policy == "cpu_serve" or (self.policy in ("spice_prefetch", "spice_dummy")
                                               and self.fallback == "cpu"):
-                self._run_cpu_group(layer, eid, toks, x, out)
+                cpu_groups.append((eid, toks))
                 self.stats["cpu_groups"] += 1
                 continue
 
@@ -490,6 +529,8 @@ class BatchRuntime:
             y = swiglu(xe, *self.cache.tensors(sid)) * w
             out.index_add_(0, rows, y)
             self.stats["gpu_groups"] += 1
+        if cpu_groups:
+            self._run_cpu_groups(layer, cpu_groups, x, out)
         return out
 
     def check_forecast_alignment(self, layer: int, topk_i: torch.Tensor) -> bool:
@@ -522,13 +563,27 @@ class BatchRuntime:
 
     def _run_cpu_group(self, layer: int, eid: int, toks: list[tuple[int, float, int]],
                        x: torch.Tensor, out_gpu: torch.Tensor) -> None:
-        rows_cpu = torch.tensor([r for r, _w, _rank in toks], dtype=torch.long)
-        weights_cpu = torch.tensor([wt for _r, wt, _rank in toks], dtype=self.bank.dtype).unsqueeze(1)
         x_cpu = x.detach().to("cpu", self.bank.dtype)
-        xe = x_cpu.index_select(0, rows_cpu)
-        y_cpu = swiglu(xe, *self.bank.get(layer, eid)) * weights_cpu
-        rows_gpu = rows_cpu.to(self.dev, non_blocking=True)
-        out_gpu.index_add_(0, rows_gpu, y_cpu.to(self.dev, non_blocking=True))
+        out_cpu = torch.zeros_like(x_cpu)
+        self._run_cpu_groups_from_cpu(layer, [(eid, toks)], x_cpu, out_cpu)
+        out_gpu.add_(out_cpu.to(self.dev, non_blocking=True))
+
+    def _run_cpu_groups(self, layer: int, groups: list[tuple[int, list[tuple[int, float, int]]]],
+                        x: torch.Tensor, out_gpu: torch.Tensor) -> None:
+        x_cpu = x.detach().to("cpu", self.bank.dtype)
+        out_cpu = torch.zeros_like(x_cpu)
+        self._run_cpu_groups_from_cpu(layer, groups, x_cpu, out_cpu)
+        out_gpu.add_(out_cpu.to(self.dev, non_blocking=True))
+        self.stats["cpu_layers"] += 1
+
+    def _run_cpu_groups_from_cpu(self, layer: int, groups: list[tuple[int, list[tuple[int, float, int]]]],
+                                 x_cpu: torch.Tensor, out_cpu: torch.Tensor) -> None:
+        for eid, toks in groups:
+            rows_cpu = torch.tensor([r for r, _w, _rank in toks], dtype=torch.long)
+            weights_cpu = torch.tensor([wt for _r, wt, _rank in toks], dtype=self.bank.dtype).unsqueeze(1)
+            xe = x_cpu.index_select(0, rows_cpu)
+            y_cpu = swiglu(xe, *self.bank.get(layer, eid)) * weights_cpu
+            out_cpu.index_add_(0, rows_cpu, y_cpu)
 
 
 def make_batched_forward(block, layer_idx: int, rt: BatchRuntime):
@@ -653,6 +708,8 @@ def main() -> None:
     parser.add_argument("--n_batches", type=int, default=4)
     parser.add_argument("--max_lead", type=int, default=3)
     parser.add_argument("--prefetch_per_layer", type=int, default=4)
+    parser.add_argument("--prefetch_budget_per_step", type=int, default=-1,
+                        help="-1 means unlimited; otherwise max forecast H2D expert issues per decode step")
     parser.add_argument("--staging_slots", type=int, default=256)
     parser.add_argument("--forecast_alignment", choices=["off", "warn", "fail"], default="fail")
     parser.add_argument("--persistent_state", action="store_true",
@@ -736,6 +793,7 @@ def main() -> None:
         max_lead=args.max_lead,
         prefetch_per_layer=args.prefetch_per_layer,
         forecast_alignment=args.forecast_alignment,
+        prefetch_budget_per_step=args.prefetch_budget_per_step,
     )
     patch_model(model, rt)
     expert_mb = (3 * d_model * d_inter * torch.tensor([], dtype=dtype).element_size()) / 1e6
@@ -814,6 +872,7 @@ def main() -> None:
         "warmup": args.warmup,
         "cache_experts": args.cache_experts,
         "staging_slots": args.staging_slots if staging is not None else 0,
+        "prefetch_budget_per_step": args.prefetch_budget_per_step,
         "persistent_state": bool(args.persistent_state),
         "forecast_alignment": args.forecast_alignment,
         "mean_step_ms": mean_step,
