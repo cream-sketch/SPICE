@@ -36,9 +36,14 @@ Bars: full-bf16 H2D per token = 75.5 ms; cpu_serve is cache-independent.
    (~1.43x, 30%). A ZipServ-style FUSED decode-GEMV (decode in-register, no separate pass) is
    projected ~55-62 ms (codex) -- exact, beats baselines, but reproduces published work and needs a
    custom CUDA kernel. Compression is prior work, not a SPICE contribution.
-6. **SPICE forecast / prefetch helps nowhere dramatically at batch=1.** Prefetch hides latency, but
-   the wall is volume; gos (forecast prefetch) measured 142 ms (worst). The only batch=1 setting where
-   forecast could matter (deep compressed pipeline) is gated by the marginal compression ratio.
+6. **SPICE forecast / prefetch has NO viable foothold at batch=1 (closed at the upper bound).**
+   Triple negative: (a) uncompressed gos prefetch 142 ms (no compute shadow); (b) compressed shallow
+   within-layer pipeline 85 ms; (c) compressed + ORACLE per-token routing + deep cross-layer prefetch
+   pipeline 78.9 ms -- still loses to on_demand 75 / cpu_serve 77. Even perfect routing + deep pipeline
+   cannot win because nvCOMP separate-decode cost + per-token stream-issue overhead eat the overlap.
+   Only a ZipServ-style FUSED decode-GEMV (decode in-register, no separate pass) could help, projected
+   ~55-62 ms (modest ~20%, reproduces published work + needs custom CUDA). Prefetch needs a REUSE
+   regime (batch>1 / speculative window) -- the only place a compute shadow exists.
 
 ## Implication for direction
 
