@@ -28,3 +28,28 @@ Notes:
 
 Verdict: SPICE paper reproduces across all metric families. Train/correctness exact; system rankings and
 the K-sweep crossover reproduce; verified-prefetch improved by later eval fixes.
+
+## Speedup ratios -- BIT-EXACT (in the SIMULATOR), with the critical real-HW caveat
+
+cache_sweep with the reference expert_mb=14500 (NOT the run-script default 8) reproduces the SPICE
+speedup ratios bit-exact vs device3_prefetch_system_summary.csv:
+  cache=128:  vs naive 1.81x  vs lru 1.10x  vs pregated 1.34x
+  cache=256:  vs naive 3.48x  vs lru 1.08x  vs pregated 0.58x
+  cache=512:  vs naive 8.23x  vs lru 1.26x  vs pregated 0.49x
+  cache=1024: vs naive 76.19x vs lru 1.64x  vs pregated 0.39x
+  cache=2048: vs naive 74.35x vs lru 1.60x  vs pregated 0.37x
+
+CRITICAL: these are SIMULATOR speedups. The sim cost model (sim_tpot = compute + stall + draft;
+stall = fallback_slots x copy_ms) ASSUMES prefetch overlaps compute for free (no PCIe critical-path
+competition). Decomposition:
+- "vs naive" (1.8-76x) is mostly CACHING (naive has cache_hit=0); a real reactive LRU already captures it.
+  Our real on_demand corresponds to the sim's `lru`, NOT `naive`.
+- "vs lru" (1.08-1.64x) is the prefetch-specific benefit -- and it rests on the free-overlap assumption.
+- "vs pregated" is <1x (SPICE loses) at cache>=256 -- in the paper's own data.
+
+Real hardware REFUTES the prefetch part at batch=1 short-context: gos forecast-prefetch measured 142ms
+vs on_demand 76ms (no compute shadow, PCIe bandwidth-saturated -> prefetch cannot overlap for free). So
+"reproducing the paper speedup" reproduces the SIM; it does NOT establish a real prefetch speedup. Real
+prefetch speedup needs a compute shadow (long context / reuse) + a cheap forecaster (LoRE) that does not
+itself consume the shadow -- the open contribution. (This is exactly why the project moved from sim to
+real-hardware measurement.)
