@@ -75,3 +75,22 @@ Lossless compression is the strongest EXACT batch=1 PCIe lever: ~1.4x bytes -> ~
 75-77 ms, ~30% TPOT. NOT a 2-4x win (entropy + Ampere decompress speed cap it). Pipelined overlap is
 PROVEN feasible. In the compressed regime, SPICE forecast regains a role (close the per-layer-barrier
 gap ~66 -> ~54 ms) -- the first batch=1 setting where prefetch is not useless.
+
+## FUSED decode-GEMV in offload: compression DOES win (real measurement)
+
+The separate-decode failure (compressed_fetch 85ms) is fixed by a ZipServ-style FUSED decode-GEMV
+(decode-in-register during the GEMV, no separate decode pass; fixed-length 4-bit exponent-code lossless
+format, ratio 1.333x, bit-exact). `fused_decode_gemv.py` (Triton kernel + packer) + `fused_offload_bench.py`.
+
+In-HBM the fused kernel is ALU-bound (118 GB/s vs 427 for plain F.linear -> 0.37x) -- but that is the
+WRONG metric for offload: in offload PCIe (22 GB/s) is the wall and the fused GEMV (118 GB/s) is 5x
+faster than PCIe, so decode is fully hidden. Per-token offload microbench (96 experts, batch=1, A800):
+
+    on_demand full H2D   78.88 ms/token
+    fused_compressed     61.12 ms/token   speedup 1.291x   (EXACT)
+    PCIe floor: full 75.5 / compressed 56.6
+
+So lossless compression IS a real EXACT batch=1 offload win: ~22% (close to the 1.33x ratio), via fused
+decode, NO prefetch needed (fusion removes the decode shadow that prefetch would fill). Ceiling ~1.33-1.4x
+(entropy). This is the ZipServ technique applied to MoE PCIe offload -- an engineering win, NOT a
+forecast/SPICE contribution (forecast has no role: nothing to overlap once decode is fused away).
