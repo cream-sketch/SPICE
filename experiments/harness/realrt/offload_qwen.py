@@ -499,6 +499,11 @@ def main():
     p.add_argument("--decode_tokens", type=int, default=16)
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--cache_experts", type=int, required=True, help="GPU resident expert-cache capacity")
+    p.add_argument("--mem_budget_gb", type=float, default=0.0,
+                   help="if >0, size the expert cache to this TOTAL GPU memory budget (GB) instead "
+                        "of --cache_experts (simulates a smaller GPU, e.g. 24 for RTX 4090/A10)")
+    p.add_argument("--mem_reserve_gb", type=float, default=2.0,
+                   help="GB reserved within the budget for KV-cache/activations/workspace")
     p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient",
                                         "hybrid_resident_cpu", "compressed_fetch", "split_cpu_gpu"],
                    default="on_demand_fetch")
@@ -568,12 +573,24 @@ def main():
         return
     bank, d_model, d_inter, n_layers, n_exp = offload_experts(model, dev)
     h2d = torch.cuda.Stream(device=dev)
-    cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
+    cache_experts = args.cache_experts
+    if args.mem_budget_gb:
+        # size the expert cache to a TOTAL GPU memory budget: budget - (non-expert resident:
+        # attention/shared/embed/etc, measured now that experts are off-GPU) - reserve(KV/activations).
+        used = torch.cuda.memory_allocated(dev)
+        per_expert = 3 * d_inter * d_model * 2          # gate+up+down bf16 bytes
+        avail = args.mem_budget_gb * 1e9 - used - args.mem_reserve_gb * 1e9
+        cache_experts = max(1, min(n_layers * n_exp, int(avail / per_expert)))
+        print(f"[mem] budget={args.mem_budget_gb}GB non_expert_used={used/1e9:.2f}GB "
+              f"reserve={args.mem_reserve_gb}GB -> cache_experts={cache_experts} "
+              f"({100*cache_experts/(n_layers*n_exp):.0f}% of {n_layers*n_exp}, "
+              f"{cache_experts*per_expert/1e9:.2f}GB)")
+    cache = GpuExpertCache(cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
     rt = Runtime(bank, cache, dev, args.policy)
     rt.split_g = args.split_g
     patch_model(model, rt)
     if args.policy == "hybrid_resident_cpu":
-        nres = warm_resident(cache, bank, freq, args.cache_experts)
+        nres = warm_resident(cache, bank, freq, cache_experts)
         src = "ORACLE(eval-seq)" if args.oracle_resident else "calib-text(honest)"
         print(f"[hybrid] warmed {nres} popular experts resident on GPU (popularity={src}); rest CPU-served")
 
@@ -589,7 +606,7 @@ def main():
         tpot = timed_decode_gos(model, rt, ids, ref_ids, args.warmup, dev)
     else:
         tpot = timed_decode(model, ids, ref_ids, args.warmup, dev)
-    print(f"[tpot] policy={args.policy} cache_experts={args.cache_experts} "
+    print(f"[tpot] policy={args.policy} cache_experts={cache_experts} "
           f"n_layers={n_layers} n_exp={n_exp} TPOT_ms={tpot:.3f} "
           f"cache(hit={cache.stats['hit']},miss={cache.stats['miss']},evict={cache.stats['evict']})")
 
