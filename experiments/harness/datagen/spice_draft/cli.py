@@ -32,7 +32,10 @@ def parse_args():
     p.add_argument("--model_dir", required=True)
     p.add_argument("--text_file", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--gpu", type=int, default=None,
+                   help="CUDA device index. Required when CUDA is available; no implicit GPU0 default.")
+    p.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16",
+                   help="dtype used for target forward and draft rollout")
     p.add_argument("--top_k", type=int, default=0, help="0 -> use the model's default (qwen 4 / deepseek 6)")
     p.add_argument("--max_horizon", type=int, default=6)
     p.add_argument("--max_samples", type=int, default=16)
@@ -48,12 +51,19 @@ def main() -> None:
     args = parse_args()
     adapter = ADAPTERS[args.model_type]()
     top_k = args.top_k or adapter.top_k_default
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        if args.gpu is None:
+            raise ValueError("CUDA is available; pass --gpu explicitly (no implicit GPU0 default)")
+        device = torch.device(f"cuda:{args.gpu}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = adapter.load_model(args.model_dir, device)
+    model = adapter.load_model(args.model_dir, device, dtype)
 
     texts = [l.strip() for l in Path(args.text_file).read_text(encoding="utf-8").splitlines() if l.strip()][: args.max_samples]
 
@@ -96,6 +106,7 @@ def main() -> None:
         "model_dir": args.model_dir,
         "model_type": args.model_type,
         "top_k": top_k,
+        "dtype": args.dtype,
         "max_horizon": args.max_horizon,
         "num_texts": len(texts),
         "recall_at_k_by_horizon": {
@@ -109,7 +120,8 @@ def main() -> None:
     Path(args.out).write_text(json.dumps(report, indent=2))
     if dump_dir:
         write_manifest(dump_dir, dump_files, top_k, args.max_horizon, args.model_dir,
-                       extra={"oracle_fcast": bool(args.oracle_fcast), "moe_layers_only": True})
+                       extra={"oracle_fcast": bool(args.oracle_fcast), "moe_layers_only": True,
+                              "dtype": args.dtype})
         print(f"[dump] {len(dump_files)} forecast files + manifest -> {dump_dir}")
     print(json.dumps(report["recall_at_k_by_horizon"], indent=2))
 

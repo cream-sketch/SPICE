@@ -39,9 +39,9 @@ def _ds_shared_only_forward(self, hidden_states):
 class DeepSeekV2Adapter(DraftAdapter):
     top_k_default = 6
 
-    def load_model(self, model_dir, device):
+    def load_model(self, model_dir, device, dtype=torch.bfloat16):
         model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch.bfloat16, local_files_only=True,
+            model_dir, torch_dtype=dtype, local_files_only=True,
             low_cpu_mem_usage=True, trust_remote_code=True, attn_implementation="eager",
         ).to(device).eval()
         return model

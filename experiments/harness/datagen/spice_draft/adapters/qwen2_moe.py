@@ -33,9 +33,9 @@ def _shared_only_mlp_forward(mlp, hidden_states: torch.Tensor):
 class Qwen2MoEAdapter(DraftAdapter):
     top_k_default = 4
 
-    def load_model(self, model_dir, device):
+    def load_model(self, model_dir, device, dtype=torch.bfloat16):
         model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch.bfloat16, local_files_only=True, low_cpu_mem_usage=True,
+            model_dir, torch_dtype=dtype, local_files_only=True, low_cpu_mem_usage=True,
         ).to(device).eval()
         return model
 

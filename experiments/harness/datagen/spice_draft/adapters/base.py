@@ -18,7 +18,7 @@ import torch
 class DraftAdapter:
     top_k_default: int = 4
 
-    def load_model(self, model_dir: str, device: torch.device):
+    def load_model(self, model_dir: str, device: torch.device, dtype: torch.dtype = torch.bfloat16):
         """Return the loaded, eval-mode target model on `device`."""
         raise NotImplementedError
 

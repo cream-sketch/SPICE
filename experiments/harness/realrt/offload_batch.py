@@ -151,6 +151,12 @@ class GpuExpertCache:
     def tensors(self, sid: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.gate[sid], self.up[sid], self.down[sid]
 
+    def reset_state(self) -> None:
+        self.free = list(range(self.cap))
+        self.map.clear()
+        self.lru.clear()
+        self.ready = [None] * self.cap
+
 
 class TransientStaging:
     """Low-priority transient staging slots for SPICE forecasted future experts."""
@@ -216,6 +222,12 @@ class TransientStaging:
         for key in list(self.map):
             self._retire_key(key, used=False)
         self.reclaim()
+
+    def reset_state(self) -> None:
+        self.free = list(range(self.slots))
+        self.map.clear()
+        self.ready = [None] * self.slots
+        self.retiring.clear()
 
     def _retire_key(self, key: tuple[int, int], used: bool) -> None:
         sid = self.map.pop(key)
@@ -362,7 +374,7 @@ def build_stream_batch(stream: torch.Tensor, batch: int, prompt_len: int, decode
 class BatchRuntime:
     def __init__(self, bank: ExpertBank, cache: GpuExpertCache, staging: TransientStaging | None,
                  dev: torch.device, policy: str, fallback: str, max_lead: int,
-                 prefetch_per_layer: int) -> None:
+                 prefetch_per_layer: int, forecast_alignment: str) -> None:
         self.bank = bank
         self.cache = cache
         self.staging = staging
@@ -371,6 +383,7 @@ class BatchRuntime:
         self.fallback = fallback
         self.max_lead = max_lead
         self.prefetch_per_layer = prefetch_per_layer
+        self.forecast_alignment = forecast_alignment
         self.prefetch_enabled = False
         self.current_positions: list[int] = []
         self.current_forecasts: list[ForecastItem] = []
@@ -479,6 +492,34 @@ class BatchRuntime:
             self.stats["gpu_groups"] += 1
         return out
 
+    def check_forecast_alignment(self, layer: int, topk_i: torch.Tensor) -> bool:
+        if self.forecast_alignment == "off" or not self.prefetch_enabled or not self.current_forecasts:
+            return True
+        if topk_i.shape[0] != len(self.current_forecasts):
+            self.stats["forecast_align_skipped_shape"] += 1
+            return False
+        got = topk_i.detach().cpu()
+        ok = True
+        for row, (pos, fc) in enumerate(zip(self.current_positions, self.current_forecasts)):
+            if layer >= fc.true_top.shape[0] or pos >= fc.true_top.shape[1]:
+                self.stats["forecast_align_skipped_oob"] += 1
+                ok = False
+                continue
+            expect = fc.true_top[layer, pos].detach().cpu()
+            self.stats["forecast_align_checked"] += 1
+            if set(got[row].tolist()) != set(expect.tolist()):
+                ok = False
+                self.stats["forecast_align_mismatch"] += 1
+                if self.forecast_alignment == "fail":
+                    raise RuntimeError(
+                        f"forecast true_top mismatch at layer={layer} row={row} pos={pos}: "
+                        f"runtime={got[row].tolist()} dump={expect.tolist()} "
+                        f"(regenerate forecast with matching tokenizer/model/dtype)"
+                    )
+        if not ok:
+            self.stats["forecast_align_blocked_prefetch"] += 1
+        return ok
+
     def _run_cpu_group(self, layer: int, eid: int, toks: list[tuple[int, float, int]],
                        x: torch.Tensor, out_gpu: torch.Tensor) -> None:
         rows_cpu = torch.tensor([r for r, _w, _rank in toks], dtype=torch.long)
@@ -507,7 +548,8 @@ def make_batched_forward(block, layer_idx: int, rt: BatchRuntime):
             topk_w = topk_w / topk_w.sum(dim=-1, keepdim=True)
         topk_w = topk_w.to(x.dtype)
         shared = F.sigmoid(shared_gate(x)) * shared_expert(x)
-        rt.issue_forecast(layer_idx)
+        if rt.check_forecast_alignment(layer_idx, topk_i):
+            rt.issue_forecast(layer_idx)
         routed = rt.run_experts_batched(layer_idx, topk_i, topk_w, x)
         return (routed + shared).view(bsz, seq_len, dim), router_logits
 
@@ -612,10 +654,15 @@ def main() -> None:
     parser.add_argument("--max_lead", type=int, default=3)
     parser.add_argument("--prefetch_per_layer", type=int, default=4)
     parser.add_argument("--staging_slots", type=int, default=256)
+    parser.add_argument("--forecast_alignment", choices=["off", "warn", "fail"], default="fail")
+    parser.add_argument("--persistent_state", action="store_true",
+                        help="keep HBM cache/staging state across n_batches draws")
     parser.add_argument("--check_exact", action="store_true")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
 
+    if args.warmup < 0 or args.warmup >= args.decode_tokens:
+        raise ValueError("--warmup must satisfy 0 <= warmup < decode_tokens")
     if args.policy in ("spice_prefetch", "spice_dummy") and not (args.forecast_dir and args.text_file):
         raise ValueError("spice_prefetch/spice_dummy require --forecast_dir and --text_file for position alignment")
 
@@ -648,6 +695,11 @@ def main() -> None:
             forecasts = forecasts[:n]
             tokenized = tokenized[:n]
             print(f"[align] truncated text/forecast rows to {n}")
+        f_dtype = manifest.get("dtype")
+        if f_dtype is None:
+            raise ValueError("forecast manifest has no dtype; regenerate with spice_draft --dtype fp16")
+        elif f_dtype != args.dtype:
+            raise ValueError(f"forecast dtype {f_dtype!r} does not match runtime dtype {args.dtype!r}")
         print(f"[forecast] files={len(forecasts)} top_k={manifest.get('top_k')} "
               f"max_horizon={manifest.get('max_horizon')} oracle={manifest.get('oracle_fcast')}")
 
@@ -655,6 +707,18 @@ def main() -> None:
         stream = load_token_stream(tokenizer, args.dataset_dir, args.split)
     else:
         stream = None
+
+    exact_batch = None
+    ref_logits = None
+    if args.check_exact:
+        if tokenized is not None:
+            exact_batch = build_text_batch(
+                tokenized, args.batch, args.prompt_len, args.decode_tokens, 0, dev, forecasts
+            )
+        else:
+            exact_batch = build_stream_batch(stream, args.batch, args.prompt_len, args.decode_tokens, 0, dev)
+        print("[exact] collecting full-resident FP16 reference before expert offload", flush=True)
+        ref_logits = teacher_forced_logits(model, exact_batch[0], exact_batch[1])
 
     bank, d_model, d_inter, n_layers, n_exp = offload_experts(model, dtype)
     h2d = torch.cuda.Stream(device=dev)
@@ -671,13 +735,14 @@ def main() -> None:
         fallback=args.fallback,
         max_lead=args.max_lead,
         prefetch_per_layer=args.prefetch_per_layer,
+        forecast_alignment=args.forecast_alignment,
     )
     patch_model(model, rt)
+    expert_mb = (3 * d_model * d_inter * torch.tensor([], dtype=dtype).element_size()) / 1e6
 
     rows = []
     step_times = []
     per_tok_times = []
-    exact_checked = False
     for draw in range(args.n_batches):
         if tokenized is not None:
             input_ids, token_ids, batch_fc, seq_ids = build_text_batch(
@@ -688,22 +753,24 @@ def main() -> None:
                 stream, args.batch, args.prompt_len, args.decode_tokens, draw, dev
             )
 
-        if args.check_exact and not exact_checked:
-            # Reference is the same FP16 full model path before offload is impossible here because
-            # experts are already offloaded.  Instead validate deterministic replay consistency of
-            # the patched exact path and report argmax stability across two passes.
-            reset_stats(rt, cache, staging)
-            logits_a = teacher_forced_logits(model, input_ids, token_ids, rt, batch_fc, args.prompt_len)
-            reset_stats(rt, cache, staging)
-            logits_b = teacher_forced_logits(model, input_ids, token_ids, rt, batch_fc, args.prompt_len)
-            maxdiff = max(float((a - b).abs().max()) for a, b in zip(logits_a, logits_b))
-            argmatch = all(torch.equal(a.argmax(-1), b.argmax(-1)) for a, b in zip(logits_a, logits_b))
-            print(f"[exact] patched_fp16_replay_selfcheck max_logit_diff={maxdiff:.6g} argmax_match={argmatch}")
-            exact_checked = True
-
+        if not args.persistent_state:
+            torch.cuda.synchronize(dev)
+            cache.reset_state()
+            if staging is not None:
+                staging.reset_state()
         reset_stats(rt, cache, staging)
         step_ms = timed_teacher_forced(model, input_ids, token_ids, args.warmup, dev, rt, batch_fc, args.prompt_len)
         stats = summarize_stats(rt, cache, staging)
+        measured_tokens = max(1, (args.decode_tokens - args.warmup) * args.batch)
+        demand_h2d_mb_tok = stats.get("cache_miss", 0.0) * expert_mb / measured_tokens
+        prefetch_h2d_mb_tok = stats.get("staging_issued", 0.0) * expert_mb / measured_tokens
+        pred = max(1.0, stats.get("rt_forecast_union", 0.0))
+        true_u = max(1.0, stats.get("rt_forecast_true_union", 0.0))
+        tp = stats.get("rt_forecast_true_positive", 0.0)
+        stats["demand_h2d_mb_per_token"] = demand_h2d_mb_tok
+        stats["prefetch_h2d_mb_per_token"] = prefetch_h2d_mb_tok
+        stats["forecast_union_precision"] = tp / pred
+        stats["forecast_union_recall"] = tp / true_u
         per_tok = step_ms / args.batch
         step_times.append(step_ms)
         per_tok_times.append(per_tok)
@@ -717,8 +784,23 @@ def main() -> None:
         rows.append(row)
         unique = stats.get("rt_actual_unique", 0.0) / max(1, args.decode_tokens - args.warmup)
         staged = stats.get("rt_staged_used", 0.0) / max(1, args.decode_tokens - args.warmup)
+        align_bad = stats.get("rt_forecast_align_mismatch", 0.0)
         print(f"[draw] {draw} step_ms={step_ms:.2f} per_token_ms={per_tok:.2f} "
-              f"unique/step={unique:.1f} staged_used/step={staged:.1f} seq_ids={seq_ids}", flush=True)
+              f"unique/step={unique:.1f} staged_used/step={staged:.1f} "
+              f"align_mismatch={align_bad:.0f} seq_ids={seq_ids}", flush=True)
+
+    exact_report = None
+    if args.check_exact and exact_batch is not None and ref_logits is not None:
+        torch.cuda.synchronize(dev)
+        cache.reset_state()
+        if staging is not None:
+            staging.reset_state()
+        reset_stats(rt, cache, staging)
+        patched_logits = teacher_forced_logits(model, exact_batch[0], exact_batch[1], rt, exact_batch[2], args.prompt_len)
+        maxdiff = max(float((a - b).abs().max()) for a, b in zip(ref_logits, patched_logits))
+        argmatch = all(torch.equal(a.argmax(-1), b.argmax(-1)) for a, b in zip(ref_logits, patched_logits))
+        exact_report = {"max_logit_diff": maxdiff, "argmax_match": bool(argmatch)}
+        print(f"[exact] vs_full_resident_fp16 max_logit_diff={maxdiff:.6g} argmax_match={argmatch}", flush=True)
 
     mean_step = sum(step_times) / len(step_times)
     mean_per_tok = sum(per_tok_times) / len(per_tok_times)
@@ -732,10 +814,13 @@ def main() -> None:
         "warmup": args.warmup,
         "cache_experts": args.cache_experts,
         "staging_slots": args.staging_slots if staging is not None else 0,
+        "persistent_state": bool(args.persistent_state),
+        "forecast_alignment": args.forecast_alignment,
         "mean_step_ms": mean_step,
         "mean_per_token_ms": mean_per_tok,
         "n_layers": n_layers,
         "n_exp": n_exp,
+        "exact": exact_report,
         "rows": rows,
     }
     print(f"[tpot] policy={args.policy} fallback={args.fallback} dtype={args.dtype} "
