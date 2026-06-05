@@ -41,12 +41,13 @@ def capture(model, ids, dev):
         return h
 
     def gate_hook(store, k):
+        # gate input is FLATTENED [B*S, d] -> output [B*S, *] (no batch dim); for batch=1 that's [S, *].
         def h(m, inp, out):
             first = out[0] if isinstance(out, tuple) else out
             if isinstance(out, tuple) and first.dtype in (torch.int32, torch.int64):
-                store.append(first.detach()[0][:, :k].cpu())                       # DeepSeek: top-k idx
+                store.append(first.detach()[:, :k].cpu())                        # DeepSeek: top-k idx [S,k]
             else:
-                store.append(first.detach()[0].float().topk(k, dim=-1).indices.cpu())  # logits -> top-k
+                store.append(first.detach().float().topk(k, dim=-1).indices.cpu())  # logits [S,E] -> [S,k]
         return h
 
     for layer in model.model.layers:
