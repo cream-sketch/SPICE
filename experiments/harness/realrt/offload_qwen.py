@@ -14,6 +14,7 @@ Bilingual note: 真实 offload 解码,非模拟器;routed 专家在 CPU pinned,G
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import time
 
 import torch
@@ -106,6 +107,16 @@ class GpuExpertCache:
 
 def _swiglu(x, gate_w, up_w, down_w):
     return F.linear(F.silu(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+
+
+def _cpu_serve_experts(bank, layer, eids_w, x_cpu):
+    """CPU-serve a set of experts (runs in a worker thread; torch CPU matmul releases the GIL)."""
+    out = None
+    for eid, w in eids_w:
+        gw, uw, dw = bank.get(layer, eid)
+        y = _swiglu(x_cpu, gw, uw, dw)[0] * w
+        out = y if out is None else out + y
+    return out
 
 
 # ---------- lossless compressed fetch (transfer compressed bytes, decompress on GPU, pipelined) ----------
@@ -244,6 +255,8 @@ class Runtime:
         self.bank = bank; self.cache = cache; self.dev = dev; self.policy = policy
         self.draft_mode = False
         self.decomp = None   # Decompressor, set for compressed_fetch
+        self.split_g = 0.5   # split_cpu_gpu: GPU fraction
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # CPU-serve worker
 
     def on_forecast(self, layer, eids):
         """Draft forward predicted these experts for `layer` -> stage them now (low-stream H2D)."""
@@ -283,6 +296,35 @@ class Runtime:
                     y = _swiglu(x1.to("cpu", torch.bfloat16), gw, uw, dw)[0].to(self.dev) * w
                 out = y if out is None else out + y
             return out
+        if self.policy == "split_cpu_gpu":
+            # CPU||GPU concurrent resource split: first `gc` experts -> GPU (on_demand H2D fetch +
+            # GPU SwiGLU, async), the rest -> CPU-serve in a BACKGROUND THREAD. torch CPU matmul
+            # releases the GIL, so the main thread keeps driving the async GPU work while the worker
+            # computes on CPU -> real overlap, per-layer cost -> max(CPU, GPU). Exact.
+            cur = torch.cuda.current_stream(self.dev)
+            x1 = x0.unsqueeze(0)
+            k = len(eids)
+            gc = int(round(self.split_g * k))
+            wlist = probs.tolist()
+            # CPU side: dispatch to the worker thread FIRST (so it runs during GPU issue+exec).
+            fut = None
+            if gc < k:
+                x_cpu = x1.to("cpu", torch.bfloat16)
+                cpu_ew = [(eids[j], wlist[j]) for j in range(gc, k)]
+                fut = self.pool.submit(_cpu_serve_experts, self.bank, layer, cpu_ew, x_cpu)
+            # GPU side: issue fetches (async H2D) + compute (async); runs while the worker computes.
+            gpu_out = None
+            gpu_sids = [(self.cache.get_slot(layer, eids[j], self.bank), wlist[j]) for j in range(gc)]
+            for sid, w in gpu_sids:
+                ev = self.cache.ready[sid]
+                if ev is not None:
+                    cur.wait_event(ev)
+                y = _swiglu(x1, self.cache.gate[sid], self.cache.up[sid], self.cache.down[sid])[0] * w
+                gpu_out = y if gpu_out is None else gpu_out + y
+            if fut is None:
+                return gpu_out
+            cpu_out = fut.result().to(self.dev, non_blocking=True)   # blocks main; GPU ran meanwhile
+            return cpu_out if gpu_out is None else gpu_out + cpu_out
         if self.policy == "compressed_fetch":
             # lossless compressed transfer + pipelined GPU decode. SOFTWARE-PIPELINE the layer's
             # misses: issue ALL H2D copies first (copy stream), THEN all decodes (decode stream,
@@ -458,7 +500,11 @@ def main():
     p.add_argument("--warmup", type=int, default=4)
     p.add_argument("--cache_experts", type=int, required=True, help="GPU resident expert-cache capacity")
     p.add_argument("--policy", choices=["on_demand_fetch", "cpu_serve", "gos_transient",
-                                        "hybrid_resident_cpu", "compressed_fetch"], default="on_demand_fetch")
+                                        "hybrid_resident_cpu", "compressed_fetch", "split_cpu_gpu"],
+                   default="on_demand_fetch")
+    p.add_argument("--split_g", type=float, default=0.5,
+                   help="split_cpu_gpu: fraction of each token's top-k experts served by GPU "
+                        "(rest CPU-served concurrently); g=0 -> all CPU, g=1 -> all GPU")
     p.add_argument("--cpu_threads", type=int, default=16)
     p.add_argument("--check_exact", action="store_true")
     p.add_argument("--calib_prompt", default="In economics, the theory of comparative advantage explains how nations",
@@ -524,6 +570,7 @@ def main():
     h2d = torch.cuda.Stream(device=dev)
     cache = GpuExpertCache(args.cache_experts, d_model, d_inter, dev, torch.bfloat16, h2d)
     rt = Runtime(bank, cache, dev, args.policy)
+    rt.split_g = args.split_g
     patch_model(model, rt)
     if args.policy == "hybrid_resident_cpu":
         nres = warm_resident(cache, bank, freq, args.cache_experts)
