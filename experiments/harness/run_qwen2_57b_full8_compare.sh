@@ -64,7 +64,7 @@ echo "[stage] build real-LoRE forecast" | tee -a "$RUN/full_pipeline.log"
   --gpu 0 \
   2>&1 | tee "$RUN/forecast.log"
 
-echo "[stage] SPICE exact residual runtime" | tee -a "$RUN/full_pipeline.log"
+echo "[stage] SPICE exact residual orchestration runtime" | tee -a "$RUN/full_pipeline.log"
 "$PY" experiments/harness/scheduler/spice_shallow_issuer_runtime.py \
   --forecast_dir "$RUN/forecast" \
   --cost_json "$BASE/miss_assign_qwen2_57b_bf16_t16.json" \
@@ -73,7 +73,7 @@ echo "[stage] SPICE exact residual runtime" | tee -a "$RUN/full_pipeline.log"
   --train_frac 0.5 \
   --residency 0.1 \
   --max_test_tokens 128 \
-  --policies gos_cpu \
+  --policies gos_hybrid \
   --d_model 3584 \
   --d_inter 2560 \
   --top_k 8 \
@@ -94,7 +94,7 @@ echo "[stage] SPICE substitution runtime" | tee -a "$RUN/full_pipeline.log"
   --train_frac 0.5 \
   --residency 0.1 \
   --max_test_tokens 128 \
-  --policies gos_cpu \
+  --policies gos_hybrid \
   --d_model 3584 \
   --d_inter 2560 \
   --top_k 8 \

@@ -112,11 +112,13 @@ def main() -> None:
 
     add_adapmoe_rows(rows, run / "adapmoe.json")
     add_hybrimoe_rows(rows, run / "hybrimoe.json")
-    add_spice_rows(rows, run / "spice_exact.json", "SPICE exact CPU residual")
+    add_spice_rows(rows, run / "spice_exact.json", "SPICE exact residual orchestration")
     for path in sorted(run.glob("spice_sub_rank*.json")):
+        if "cpu_only" in path.name:
+            continue
         add_spice_rows(rows, path, "SPICE + low-confidence substitution")
 
-    spice_exact = next((r for r in rows if r["method"] == "SPICE exact CPU residual"), None)
+    spice_exact = next((r for r in rows if r["method"] == "SPICE exact residual orchestration"), None)
     spice_tpot = spice_exact.get("tpot_ms") if spice_exact else None
 
     lines = [f"# Qwen2 Memory-Limited Comparison: `{run}`", ""]
@@ -142,7 +144,7 @@ def main() -> None:
     for row in sorted(rows, key=lambda r: (r.get("tpot_ms") is None, r.get("tpot_ms") or 1e9)):
         if spice_tpot and row.get("tpot_ms"):
             ratio = row["tpot_ms"] / spice_tpot
-            if row["method"] == "SPICE exact CPU residual":
+            if row["method"] == "SPICE exact residual orchestration":
                 vs = "1.00x"
             elif ratio < 1.0:
                 vs = f"{1.0 / ratio:.2f}x faster than SPICE exact"

@@ -36,13 +36,13 @@ The main metrics are:
 
 The methods to compare are:
 
-- SPICE exact CPU residual orchestration.
+- SPICE exact CPU-GPU residual orchestration.
 - SPICE with low-confidence substitution by shared expert / LoRE surrogate.
 - AdapMoE-style active-expert replay baseline.
 - HybriMoE-style hybrid CPU-GPU replay baseline.
 
 Internal SPICE ablations such as `deep_fetch_all`, `deep_cpu`,
-`shallow_cpu`, `shallow_scheduler`, and `gos_cpu` should not all be reported as
+`shallow_cpu`, `shallow_scheduler`, and old `gos_cpu` should not all be reported as
 external paper baselines. They are diagnostic policies unless explicitly mapped
 to a prior method.
 
@@ -139,27 +139,29 @@ Current comparison table:
 
 | method | variant | TPOT ms/token | relation to SPICE exact |
 |---|---:|---:|---:|
-| HybriMoE-style | prefetch=4 | 110.93 | 1.69x faster |
-| SPICE exact CPU residual | gos_cpu | 187.27 | 1.00x |
-| SPICE + low-confidence substitution | rank7 | 192.15 | 1.03x slower |
-| AdapMoE-style | active_m=4 | 230.70 | 1.23x slower |
-| AdapMoE-style | active_m=6 | 355.56 | 1.90x slower |
-| AdapMoE-style | active_m=8 | 485.35 | 2.59x slower |
+| HybriMoE-style | prefetch=4 | 110.93 | 1.54x faster |
+| SPICE + low-confidence substitution | gos_hybrid + rank7 | 153.33 | 1.11x faster |
+| SPICE exact residual orchestration | gos_hybrid | 170.49 | 1.00x |
+| AdapMoE-style | active_m=4 | 230.70 | 1.35x slower |
+| AdapMoE-style | active_m=6 | 355.56 | 2.09x slower |
+| AdapMoE-style | active_m=8 | 485.35 | 2.85x slower |
 
 Interpretation:
 
 - The strongest current method-level baseline result is HybriMoE-style replay,
   which is faster than the current SPICE exact configuration on this A800
   full8 trace.
-- The strongest current SPICE configuration is exact CPU residual orchestration.
-- LoRE substitution rank7 did not improve TPOT in this small full8 run; it was
-  slightly slower than exact CPU residual. Do not claim LoRE improves this
-  Qwen2 full8 result unless more tuning or a stronger LoRE checkpoint changes
-  the result.
-- The current SPICE scheduler is conservative: it sends residual misses to CPU
-  and avoids demand fetches. HybriMoE-style replay shows that a more aggressive
-  CPU/GPU split can be faster under the measured A800 cost table, so this is now
-  a key baseline pressure point to address.
+- The correct SPICE main policy is now `gos_hybrid`, not old `gos_cpu`.
+  `gos_hybrid` runs speculative prefetch admission first, then assigns exact
+  residual misses between demand H2D+GPU and CPU exact execution by measured
+  cost and current PCIe backlog.
+- Under the default conservative margin, A800 still routes most exact residual
+  misses to CPU because measured demand-fetch wins are very small. A diagnostic
+  `fetch_margin_ms=0` run produced `1.82` residual fetches/token but was slower
+  (`180.02 ms/token`), so the default cost-aware decision is defensible.
+- Low-confidence substitution rank7 now improves TPOT in this full8 run
+  (`153.33 ms/token` vs `170.49 ms/token`), but it is still a lossy path whose
+  quality impact must be measured before making a final paper claim.
 
 ## 4. What SPICE Means in This Experiment
 
@@ -476,12 +478,11 @@ Do not compare:
 
 ## 9. Current Open Issues
 
-1. LoRE substitution needs improvement.
+1. LoRE substitution needs quality validation.
 
-   Current rank7 substitution is slightly slower than exact CPU residual on
-   Qwen2 full8. Need better LoRE training, more traces, threshold tuning, or
-   quality-aware substitution policy before claiming it improves the final
-   result.
+   Current rank7 substitution is faster than exact `gos_hybrid` on Qwen2 full8,
+   but it is approximate. Need better LoRE training, more traces, threshold
+   tuning, and task-quality/PPL validation before claiming it as a final speedup.
 
 2. Accuracy datasets are not yet complete for Qwen2-57B memory-limited runs.
 
@@ -567,7 +568,8 @@ quantization and custom-kernel effects.
 For current LoRE result:
 
 ```text
-In the current Qwen2 full8 run, the exact CPU residual path is the strongest
-configuration. The low-confidence LoRE substitution path requires additional
-training and threshold tuning before being used as the main speed result.
+In the current Qwen2 full8 run, the full `gos_hybrid` configuration is the
+correct SPICE exact policy. Low-confidence substitution improves TPOT in this
+run, but it still requires quality validation before being used as the main
+paper result.
 ```

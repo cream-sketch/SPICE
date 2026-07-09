@@ -221,12 +221,12 @@ runtime_common=(
   --timed_repeats "$TIMED_REPEATS"
 )
 
-log "SPICE exact CPU residual runtime"
+log "SPICE exact residual orchestration runtime"
 run_if_missing "$RUN/spice_exact.json" \
   "$PY" experiments/harness/scheduler/spice_shallow_issuer_runtime.py \
     "${runtime_common[@]}" \
     --out "$RUN/spice_exact.json" \
-    --policies gos_cpu
+    --policies gos_hybrid
 
 if [[ -n "$SUBSTITUTE_RANKS" ]]; then
   log "SPICE low-confidence substitution runtime"
@@ -234,7 +234,7 @@ if [[ -n "$SUBSTITUTE_RANKS" ]]; then
     "$PY" experiments/harness/scheduler/spice_shallow_issuer_runtime.py \
       "${runtime_common[@]}" \
       --out "$RUN/spice_sub_rank${SUBSTITUTE_RANKS//,/}.json" \
-      --policies gos_cpu \
+      --policies gos_hybrid \
       --substitute_ranks "$SUBSTITUTE_RANKS"
 fi
 

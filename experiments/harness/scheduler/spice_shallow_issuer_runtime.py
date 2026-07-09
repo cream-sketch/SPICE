@@ -32,6 +32,11 @@ Policies:
                         burst and can finish before that future-layer deadline.
                         Staged hits can then be promoted to the resident cache
                         using always/never/diagnostic selective-admission rules.
+  gos_hybrid          : Full SPICE heterogeneous orchestration. Uses the same
+                        GOS speculative prefetch admission, then assigns exact
+                        residual misses between demand H2D+GPU and CPU exact
+                        execution according to the measured split cost and
+                        current PCIe backlog.
   gos_dummy_cpu       : GOS-admitted H2D perturbation control. Prefetched experts
                         are not consumed as hits, so this is a state-divergent
                         control, not an identical-traffic replay.
@@ -695,7 +700,7 @@ def main() -> None:
                     # much low traffic can be ahead of a future demand miss.
                     max_lead = min(args.max_lead_layers, max_horizon - 1, n_layers - layer - 1)
                     resident_or_staged = set(resident_map) | issuer.staged_keys() | set(issuer.pending)
-                    if policy in ("gos_cpu", "gos_dummy_cpu"):
+                    if policy in ("gos_cpu", "gos_dummy_cpu", "gos_hybrid", "gos_dummy_hybrid"):
                         candidates_by_target = defaultdict(list)
                         for lead in range(max(1, args.min_prefetch_lead), max_lead + 1):
                             target_layer = layer + lead
@@ -764,7 +769,7 @@ def main() -> None:
                         n_fetch = len(misses)
                     elif policy.endswith("cpu"):
                         n_fetch = 0
-                    elif policy == "shallow_scheduler":
+                    elif policy in ("shallow_scheduler", "gos_hybrid", "gos_dummy_hybrid"):
                         n_fetch = choose_fetch_count(len(misses), issuer.active_low_count(), cost_table,
                                                      t_fetch, args.fetch_margin_ms)
                     else:
