@@ -69,20 +69,20 @@ def add_adapmoe_rows(rows: list[dict[str, Any]], path: Path) -> None:
         )
 
 
-def add_pregated_rows(rows: list[dict[str, Any]], path: Path) -> None:
+def add_hybrimoe_rows(rows: list[dict[str, Any]], path: Path) -> None:
     data = load_json(path)
     if not data:
         return
     for row in data.get("rows", []):
         rows.append(
             {
-                "method": "Pre-gated-style fetch-only",
-                "variant": row.get("policy", "deep_fetch_all"),
+                "method": "HybriMoE-style",
+                "variant": f"prefetch={row.get('prefetch_size', '-')}",
                 "tpot_ms": row.get("tpot_ms"),
                 "tokens": row.get("tokens"),
-                "fetch_tok": row.get("residual_fetches_per_tok"),
-                "cpu_tok": row.get("cpu_served_per_tok", 0.0),
-                "sub_tok": row.get("substituted_per_tok", 0.0),
+                "fetch_tok": row.get("demand_fetches_per_tok"),
+                "cpu_tok": row.get("cpu_served_per_tok"),
+                "sub_tok": 0.0,
                 "source": path.name,
             }
         )
@@ -111,7 +111,7 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
 
     add_adapmoe_rows(rows, run / "adapmoe.json")
-    add_pregated_rows(rows, run / "pregated_fetch_baseline.json")
+    add_hybrimoe_rows(rows, run / "hybrimoe.json")
     add_spice_rows(rows, run / "spice_exact.json", "SPICE exact CPU residual")
     for path in sorted(run.glob("spice_sub_rank*.json")):
         add_spice_rows(rows, path, "SPICE + low-confidence substitution")
@@ -141,10 +141,13 @@ def main() -> None:
     )
     for row in sorted(rows, key=lambda r: (r.get("tpot_ms") is None, r.get("tpot_ms") or 1e9)):
         if spice_tpot and row.get("tpot_ms"):
+            ratio = row["tpot_ms"] / spice_tpot
             if row["method"] == "SPICE exact CPU residual":
                 vs = "1.00x"
+            elif ratio < 1.0:
+                vs = f"{1.0 / ratio:.2f}x faster than SPICE exact"
             else:
-                vs = f"{row['tpot_ms'] / spice_tpot:.2f}x slower than SPICE exact"
+                vs = f"{ratio:.2f}x slower than SPICE exact"
         else:
             vs = "-"
         lines.append(
@@ -161,9 +164,9 @@ def main() -> None:
         )
     lines.append("")
     lines.append(
-        "Note: the Pre-gated-style row is a method-level predictive-prefetch/fetch-only baseline "
-        "on the same Qwen2 trace. The released Pre-gated MoE artifact targets Switch/T5-style "
-        "FasterTransformer models and is not a drop-in Qwen2-MoE runtime."
+        "Note: AdapMoE and HybriMoE are method-level replays on the same Qwen2 trace and "
+        "hardware cost measurements. This avoids mixing policy comparisons with unsupported "
+        "model runtimes, quantization formats, or custom kernels."
     )
     text = "\n".join(lines) + "\n"
     print(text)

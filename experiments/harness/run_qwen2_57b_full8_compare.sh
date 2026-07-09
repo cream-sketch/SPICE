@@ -118,4 +118,21 @@ echo "[stage] AdapMoE method-level replay baseline" | tee -a "$RUN/full_pipeline
   --active_m 8,6,4 \
   2>&1 | tee "$RUN/adapmoe.log"
 
+echo "[stage] HybriMoE method-level replay baseline" | tee -a "$RUN/full_pipeline.log"
+"$PY" experiments/harness/scheduler/hybrimoe_trace_replay.py \
+  --forecast_dir "$RUN/forecast" \
+  --cost_json "$BASE/miss_assign_qwen2_57b_bf16_t16.json" \
+  --resource_json "$BASE/resource_edges_a800_qwen2_57b.json" \
+  --out "$RUN/hybrimoe.json" \
+  --residency 0.1 \
+  --max_test_tokens 128 \
+  --prefetch_size 4 \
+  2>&1 | tee "$RUN/hybrimoe.log"
+
+echo "[stage] summarize comparison" | tee -a "$RUN/full_pipeline.log"
+"$PY" experiments/harness/summarize_qwen2_compare.py \
+  --run_dir "$RUN" \
+  --out "$RUN/summary.md" \
+  2>&1 | tee "$RUN/summary.log"
+
 echo DONE | tee "$RUN/full_pipeline.done"

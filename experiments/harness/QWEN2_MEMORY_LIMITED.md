@@ -39,7 +39,7 @@ The pipeline performs these stages:
 6. Run SPICE exact CPU residual scheduling.
 7. Run SPICE low-confidence substitution.
 8. Run an AdapMoE-style active-expert replay baseline.
-9. Run a Pre-gated-style predictive-prefetch fetch-only baseline.
+9. Run a HybriMoE-style hybrid CPU-GPU replay baseline.
 10. Write a Markdown summary to `$RUN_DIR/summary.md`.
 
 Main result files:
@@ -47,10 +47,10 @@ Main result files:
 - `spice_exact.json`: SPICE speculative prefetch plus exact CPU residual scheduling.
 - `spice_sub_rank*.json`: SPICE with low-confidence substitution enabled.
 - `adapmoe.json`: method-level AdapMoE-style replay on the same Qwen2 trace.
-- `pregated_fetch_baseline.json`: method-level Pre-gated-style fetch-only baseline on the same Qwen2 trace.
+- `hybrimoe.json`: method-level HybriMoE-style replay on the same Qwen2 trace.
 - `summary.md`: compact TPOT comparison table.
 
-Important baseline note: the released Pre-gated MoE artifact targets Switch/T5
-FasterTransformer models and is not a drop-in Qwen2-MoE runtime. For Qwen2-57B
-comparisons, use the method-level predictive-prefetch/fetch-only baseline unless
-a full Qwen2 port is implemented.
+Important baseline note: HybriMoE's released implementation is a
+KTransformers/GGUF runtime. For Qwen2-57B BF16 comparisons, use the method-level
+HybriMoE replay unless a full native BF16 Qwen2 port is implemented and all
+quantization/kernel differences are controlled.

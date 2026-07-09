@@ -249,12 +249,16 @@ run_if_missing "$RUN/adapmoe.json" \
     --max_test_tokens "$MAX_TEST_TOKENS" \
     --active_m "$ADAPMOE_ACTIVE_M"
 
-log "Pre-gated-style predictive-prefetch fetch-only baseline"
-run_if_missing "$RUN/pregated_fetch_baseline.json" \
-  "$PY" experiments/harness/scheduler/spice_shallow_issuer_runtime.py \
-    "${runtime_common[@]}" \
-    --out "$RUN/pregated_fetch_baseline.json" \
-    --policies deep_fetch_all
+log "HybriMoE-style hybrid CPU-GPU replay baseline"
+run_if_missing "$RUN/hybrimoe.json" \
+  "$PY" experiments/harness/scheduler/hybrimoe_trace_replay.py \
+    --forecast_dir "$FORECAST_DIR" \
+    --cost_json "$COST_JSON" \
+    --resource_json "$RESOURCE_JSON" \
+    --out "$RUN/hybrimoe.json" \
+    --residency "$RESIDENCY" \
+    --max_test_tokens "$MAX_TEST_TOKENS" \
+    --prefetch_size "${HYBRIMOE_PREFETCH_SIZE:-4}"
 
 log "summarize comparison"
 "$PY" experiments/harness/summarize_qwen2_compare.py \

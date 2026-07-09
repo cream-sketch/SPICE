@@ -39,7 +39,7 @@ The methods to compare are:
 - SPICE exact CPU residual orchestration.
 - SPICE with low-confidence substitution by shared expert / LoRE surrogate.
 - AdapMoE-style active-expert replay baseline.
-- Pre-gated-style predictive-prefetch fetch-only baseline.
+- HybriMoE-style hybrid CPU-GPU replay baseline.
 
 Internal SPICE ablations such as `deep_fetch_all`, `deep_cpu`,
 `shallow_cpu`, `shallow_scheduler`, and `gos_cpu` should not all be reported as
@@ -139,22 +139,27 @@ Current comparison table:
 
 | method | variant | TPOT ms/token | relation to SPICE exact |
 |---|---:|---:|---:|
+| HybriMoE-style | prefetch=4 | 110.93 | 1.69x faster |
 | SPICE exact CPU residual | gos_cpu | 187.27 | 1.00x |
 | SPICE + low-confidence substitution | rank7 | 192.15 | 1.03x slower |
 | AdapMoE-style | active_m=4 | 230.70 | 1.23x slower |
 | AdapMoE-style | active_m=6 | 355.56 | 1.90x slower |
 | AdapMoE-style | active_m=8 | 485.35 | 2.59x slower |
-| Pre-gated-style fetch-only | deep_fetch_all | 704.41 | 3.76x slower |
 
 Interpretation:
 
-- The strongest current speed result is SPICE exact CPU residual orchestration.
+- The strongest current method-level baseline result is HybriMoE-style replay,
+  which is faster than the current SPICE exact configuration on this A800
+  full8 trace.
+- The strongest current SPICE configuration is exact CPU residual orchestration.
 - LoRE substitution rank7 did not improve TPOT in this small full8 run; it was
   slightly slower than exact CPU residual. Do not claim LoRE improves this
   Qwen2 full8 result unless more tuning or a stronger LoRE checkpoint changes
   the result.
-- The current main speed claim should be that cost-aware CPU-GPU residual
-  orchestration reduces the critical path caused by residual expert misses.
+- The current SPICE scheduler is conservative: it sends residual misses to CPU
+  and avoids demand fetches. HybriMoE-style replay shows that a more aggressive
+  CPU/GPU split can be faster under the measured A800 cost table, so this is now
+  a key baseline pressure point to address.
 
 ## 4. What SPICE Means in This Experiment
 
@@ -229,26 +234,51 @@ Problem:
 - It is not a drop-in Qwen2-MoE runtime.
 - Directly running it on Qwen2-57B would require a substantial port.
 
-Current fair Qwen2 comparison:
+Current status:
 
-Use a method-level predictive-prefetch fetch-only baseline on the same Qwen2
-trace:
+The Pre-gated comparison is now abandoned for the main baseline table. Keep the
+notes above only as historical context.
+
+### HybriMoE
+
+The HybriMoE repo on the server is:
 
 ```bash
-spice_shallow_issuer_runtime.py --policies deep_fetch_all
+/data/ziheng/baselines/HybriMoE
 ```
 
-This gives the prefetch-only behavior: predicted experts are prefetched, but
-remaining misses still wait for H2D fetch. It does not use CPU residual or LoRE.
+Problem:
+
+- The released implementation is based on KTransformers and GGUF/CPUInfer.
+- Directly running it would mix policy effects with quantization format,
+  custom kernels, and model injection differences.
+- The repo has Qwen2-MoE optimize rules, but those rules do not give a clean
+  BF16 HuggingFace-runtime comparison against SPICE.
+
+Current fair Qwen2 comparison:
+
+Use a method-level HybriMoE-style replay on the same Qwen2 route trace:
+
+```bash
+experiments/harness/scheduler/hybrimoe_trace_replay.py
+```
+
+This models:
+
+- per-layer GPU expert cache under the same total residency budget;
+- score-aware cache eviction and next-layer prefetch;
+- hybrid CPU-GPU scheduling where cache hits run on GPU and residual misses are
+  assigned to exact CPU execution or demand fetch + GPU by measured cost.
 
 When writing the paper, phrase it as:
 
 ```text
-Pre-gated-style predictive-prefetch/fetch-only baseline on the same Qwen2 trace.
+HybriMoE-style hybrid CPU-GPU scheduling replay on the same Qwen2 trace and
+hardware cost measurements.
 ```
 
-Do not claim that the original Pre-gated artifact itself directly supports
-Qwen2-57B.
+Do not claim that the original HybriMoE/KTransformers artifact itself was run
+as-is in BF16 Qwen2-57B mode unless that port is completed.
 
 ## 6. Pitfalls Already Encountered
 
@@ -437,7 +467,8 @@ Keep these fixed across SPICE and baselines:
 
 Do not compare:
 
-- Qwen2 SPICE against Switch/T5 Pre-gated native artifact directly;
+- Qwen2 SPICE against a native artifact with a different model runtime or
+  quantization format;
 - batch=1 SPICE against a larger-batch baseline;
 - smoke subset results against full-dataset baseline results;
 - SPICE with LoRE substitution against a baseline using different accuracy
@@ -459,7 +490,7 @@ Do not compare:
    speed/precision in this setting. For future accuracy + speed, choose datasets
    that can report both task score and TTFT/TPOT under the same generation path.
 
-3. Pre-gated and AdapMoE are method-level Qwen2 replays.
+3. AdapMoE and HybriMoE are method-level Qwen2 replays.
 
    This is currently the fair way to compare on Qwen2 because original artifacts
    are not directly compatible. The paper should state this clearly.
@@ -524,13 +555,13 @@ By overlapping CPU execution with outstanding transfers and GPU computation,
 SPICE reduces the critical-path latency caused by residual expert misses.
 ```
 
-For Pre-gated baseline:
+For HybriMoE baseline:
 
 ```text
-Because the released Pre-gated MoE artifact targets Switch/T5-style
-FasterTransformer models and does not directly support Qwen2-MoE, we implement
-a method-level predictive-prefetch/fetch-only baseline on the same Qwen2 route
-trace and hardware cost measurements.
+Because the released HybriMoE artifact is a KTransformers/GGUF runtime, we
+implement a method-level HybriMoE-style replay on the same Qwen2 route trace and
+hardware cost measurements to isolate the scheduling and cache policy from
+quantization and custom-kernel effects.
 ```
 
 For current LoRE result:
